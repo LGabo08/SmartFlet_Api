@@ -13,12 +13,13 @@ class UsuarioController extends Controller
     public function store(Request $request)
     {
         $validator = Validator::make($request->all(), [
-            'email'       => 'required|email|unique:usuarios,email',
-            'apellidos'   => 'required|string|max:255',
-            'contrasena'  => 'required|string|min:6',
-            'role_id'      => 'required|exists:roles,id',
-            'estado'      => 'nullable|string|max:30',
-        ]);
+    'email'      => 'required|email|unique:usuarios,email',
+    'nombre'     => 'required|string|max:120',          
+    'apellidos'  => 'required|string|max:255',
+    'contrasena' => 'required|string|min:6',
+    'role_id'    => 'required|exists:roles,id',
+    'estado'     => 'nullable|string|max:30',
+]);
 
         if ($validator->fails()) {
             return response()->json([
@@ -27,14 +28,14 @@ class UsuarioController extends Controller
             ], 422);
         }
 
-        $usuario = Usuario::create([
-            'email'       => $request->email,
-            'apellidos'   => $request->apellidos,
-            'contrasena'  => Hash::make($request->contrasena),
-            'role_id'      => $request->role_id,
-            'estado'      => $request->estado ?? 'activo',
-        ]);
-
+       $usuario = Usuario::create([
+    'email'      => $request->email,
+    'nombre'     => $request->nombre,                   
+    'apellidos'  => $request->apellidos,
+    'contrasena' => Hash::make($request->contrasena),
+    'role_id'    => $request->role_id,
+    'estado'     => $request->estado ?? 'activo',
+]);
         return response()->json([
             'ok' => true,
             'usuario' => $usuario

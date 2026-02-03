@@ -7,12 +7,14 @@ use Tymon\JWTAuth\Contracts\JWTSubject;
 
 class Usuario extends Authenticatable implements JWTSubject
 {
+    use HasFactory;
     protected $table = 'usuarios';
     protected $primaryKey = 'idUsuario';
     public $timestamps = true; // si tu tabla ya los tiene
 
     protected $fillable = [
         'email',
+        'nombre',
         'apellidos',
         'contrasena',
         'estado',

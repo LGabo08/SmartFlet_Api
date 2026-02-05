@@ -31,9 +31,13 @@ Route::middleware('auth:api')->group(function () {
     });
 
     
-    Route::middleware('role:ADMIN')->group(function () {
-        Route::post('/usuarios', [UsuarioController::class, 'store']);
-        Route::get('/usuarios',  [UsuarioController::class, 'index']);
-    });
+  Route::middleware('role:ADMIN')->group(function () {
+    Route::post('/usuarios', [UsuarioController::class, 'store']);
+    Route::get('/usuarios',  [UsuarioController::class, 'index']);
+    Route::get('/usuarios/{id}',    [UsuarioController::class, 'show']);
+    Route::put('/usuarios/{id}',    [UsuarioController::class, 'update']);
+    Route::delete('/usuarios/{id}', [UsuarioController::class, 'destroy']);
+});
+
 
 });

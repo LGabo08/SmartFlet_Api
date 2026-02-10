@@ -83,7 +83,7 @@ class UsuarioController extends Controller
             ], 404);
         }
 
-        // ✅ IMPORTANTE: como tu PK es idUsuario, la regla unique debe indicarlo
+        
         $validator = Validator::make($request->all(), [
             'email'      => 'required|email|unique:usuarios,email,' . $usuario->idUsuario . ',idUsuario',
             'nombre'     => 'required|string|max:120',

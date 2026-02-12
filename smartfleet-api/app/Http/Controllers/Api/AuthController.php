@@ -64,11 +64,11 @@ class AuthController extends Controller
                 'message' => 'Credenciales inválidas'
             ], 401);
         }
-
+        
         $usuario = auth('api')->user();
-
+        //dd($usuario->estado); 
         // Si quieres bloquear inactivos
-        if (($usuario->estado ?? 'activo') !== 'activo') {
+        if (($usuario->estado ?? 'ACTIVO') !== 'ACTIVO') {
             auth('api')->logout();
             return response()->json([
                 'ok' => false,

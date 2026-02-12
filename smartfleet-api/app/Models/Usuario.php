@@ -20,7 +20,9 @@ class Usuario extends Authenticatable implements JWTSubject
         'estado',
         'role_id',
     ];
-
+    protected $attributes = [
+        'estado' => 'ACTIVO', // Asegura que el estado por defecto sea 'ACTIVO'
+    ];
     protected $hidden = [
         'contrasena',
     ];

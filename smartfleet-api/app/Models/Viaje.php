@@ -1,6 +1,5 @@
 <?php
-
-// src/app/Models/Viaje.php
+// app/Models/Viaje.php
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
@@ -10,53 +9,57 @@ class Viaje extends Model
 {
     use HasFactory;
 
-    // Definir la tabla
     protected $table = 'viaje';
+    protected $primaryKey = 'id_viaje';
+    public $timestamps = false;
 
-    // Definir los campos que se pueden asignar masivamente
     protected $fillable = [
         'numero_viaje',
         'fk_ruta',
         'fk_licencia_requerida',
-        'fk_certificacion_requerida', // Mantén esta relación como única
         'fk_operador',
         'fk_unidad',
         'fecha_salida',
         'fecha_llegada',
         'estado',
         'pago_operador',
+        'configuracion_unidad', // Nuevo campo
+        'cliente',              // Nuevo campo
+        'producto',             // Nuevo campo
     ];
 
-    // Definir la clave primaria
-    protected $primaryKey = 'id_viaje';
+    public function operador()
+    {
+        return $this->belongsTo(\App\Models\Operador::class, 'fk_operador', 'id_operador');
+    }
 
-    // Indicar si no usamos timestamps
-    public $timestamps = false;
-
-    // Relaciones con otras tablas
     public function ruta()
     {
-        return $this->belongsTo(Ruta::class, 'fk_ruta');
+        return $this->belongsTo(\App\Models\Ruta::class, 'fk_ruta', 'id_ruta');
     }
 
     public function licencia()
     {
-        return $this->belongsTo(Licencia::class, 'fk_licencia_requerida');
+        return $this->belongsTo(\App\Models\Licencia::class, 'fk_licencia_requerida', 'id_licencia');
     }
 
-    // Cambiar la relación de muchos a muchos a uno a uno
-    public function certificacion()
+    public function certificaciones()
     {
-        return $this->belongsTo(Certificacion::class, 'fk_certificacion_requerida'); // Ahora es 'belongsTo' en vez de 'belongsToMany'
-    }
-
-    public function operador()
-    {
-        return $this->belongsTo(Operador::class, 'fk_operador');
+        return $this->belongsToMany(
+            \App\Models\Certificacion::class,
+            'viaje_certificacion',
+            'fk_viaje',
+            'fk_certificacion'
+        )->withPivot('obligatoria');
     }
 
     public function unidad()
     {
-        return $this->belongsTo(Unidad::class, 'fk_unidad');
+        return $this->belongsTo(\App\Models\Unidad::class, 'fk_unidad', 'id_unidad');
+    }
+
+    public function rechazosOperador()
+    {
+        return $this->hasMany(\App\Models\RechazoOperador::class, 'fk_viaje', 'id_viaje');
     }
 }

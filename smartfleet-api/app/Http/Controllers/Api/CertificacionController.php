@@ -18,7 +18,7 @@ class CertificacionController extends Controller
         $validated = $request->validate([
             'nombre_certificacion' => 'required|string|max:255',
             'descripcion' => 'required|string',
-            'cliente' => 'required|string',
+            'fk_cliente' => 'required|exists:cliente,id_cliente',
         ]);
 
         return Certificacion::create($validated);
@@ -30,24 +30,36 @@ class CertificacionController extends Controller
     }
 
     public function update(Request $request, $id)
-    {
-        $certificacion = Certificacion::findOrFail($id);
+{
+    $certificacion = Certificacion::findOrFail($id);
+    
+    // Agregar log para verificar los datos
+    \Log::info('Actualizando certificación: ', $request->all());
 
-        $validated = $request->validate([
-            'nombre_certificacion' => 'required|string|max:255',
-            'descripcion' => 'required|string',
-            'cliente' => 'required|string',
-        ]);
+    $validated = $request->validate([
+        'nombre_certificacion' => 'required|string|max:255',
+        'descripcion' => 'required|string',
+        'fk_cliente' => 'required|exists:cliente,id_cliente',
+    ]);
+    
+    $certificacion->update($validated);
 
-        $certificacion->update($validated);
-
-        return $certificacion;
-    }
+    return $certificacion;
+}
 
     public function destroy($id)
     {
         Certificacion::destroy($id);
 
         return response()->json(['message' => 'Certificación eliminada correctamente']);
+    }
+
+    public function getCertificacionesPorCliente($clienteId)
+    {
+        // Filtrar las certificaciones por el cliente
+        $certificaciones = Certificacion::where('fk_cliente', $clienteId)->get();
+        
+        // Devolver las certificaciones encontradas en formato JSON
+        return response()->json($certificaciones);
     }
 }

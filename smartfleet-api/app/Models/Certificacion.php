@@ -1,6 +1,5 @@
 <?php
 
-// app/Models/Certificacion.php
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
@@ -10,13 +9,24 @@ class Certificacion extends Model
 {
     use HasFactory;
 
-    // Especifica la tabla de la base de datos (si no coincide con el nombre del modelo en plural)
     protected $table = 'certificacion';
+    protected $primaryKey = 'id_certificacion';
+    public $timestamps = false;
 
-    // Especifica los campos que se pueden asignar masivamente
+    // Se agrega fk_cliente al array de fillable
     protected $fillable = [
         'nombre_certificacion',
         'descripcion',
-        'cliente',
+        'cliente',  // Esto es el nombre del cliente, si necesitas la FK
+        'fk_cliente', // Añadimos la foreign key fk_cliente
     ];
+
+    /**
+     * Relación con el modelo de Cliente.
+     * Cada certificación pertenece a un cliente.
+     */
+    public function cliente()
+    {
+        return $this->belongsTo(Cliente::class, 'fk_cliente');  // Aquí asociamos fk_cliente con la tabla Cliente
+    }
 }

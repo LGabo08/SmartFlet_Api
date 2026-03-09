@@ -12,6 +12,9 @@ class Licencia extends Model
     // Especifica la tabla de la base de datos (si no coincide con el nombre del modelo en plural)
     protected $table = 'licencia';
 
+    // Especificar la clave primaria si no es 'id'
+    protected $primaryKey = 'id_licencia';  // Usar el nombre correcto de la columna clave primaria
+
     // Especifica los campos que se pueden asignar masivamente
     protected $fillable = [
         'nombre_licencia',

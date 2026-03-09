@@ -4,15 +4,16 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Viaje;
+use App\Models\Certificacion; // Asegúrate de importar el modelo de certificación
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 
 class AgregarViajeController extends Controller
 {
-    // Mostrar todos los viajes
+    // Mostrar todos los viajes con sus relaciones
     public function index()
     {
-        // Obtener todos los viajes con sus relaciones (ruta, licencia, etc.)
-        $viajes = Viaje::with(['ruta', 'licencia', 'certificaciones'])->get();
+        $viajes = Viaje::with(['ruta', 'licencia', 'certificaciones', 'operador', 'unidad'])->get();
 
         return response()->json(['ok' => true, 'viajes' => $viajes]);
     }
@@ -20,32 +21,64 @@ class AgregarViajeController extends Controller
     // Crear un nuevo viaje
     public function store(Request $request)
     {
-        // Validación de los datos recibidos
         $validatedData = $request->validate([
             'numero_viaje' => 'required|string|max:30|unique:viaje,numero_viaje',
             'fk_ruta' => 'required|exists:ruta,id_ruta',
             'fk_licencia_requerida' => 'required|exists:licencia,id_licencia',
-            'fk_certificacion_requerida' => 'required|exists:certificacion,id_certificacion', // Se mantiene solo una certificación
+            // ✅ MULTI CERT
+            'certificaciones' => 'required|array|min:1',
+            'certificaciones.*' => 'integer|exists:certificacion,id_certificacion',
+            'configuracion_unidad' => 'required|string|max:255', // Nuevo campo
+            'cliente' => 'required|string|max:255',              // Nuevo campo
+            'producto' => 'required|string|max:255',             // Nuevo campo
+            'fk_operador' => 'nullable|exists:operador,id_operador',
+            'fk_unidad' => 'nullable|exists:unidad,id_unidad',
             'pago_operador' => 'required|numeric|min:0',
         ]);
 
-        // Crear un nuevo viaje
-        $viaje = Viaje::create([
-            'numero_viaje' => $validatedData['numero_viaje'],
-            'fk_ruta' => $validatedData['fk_ruta'],
-            'fk_licencia_requerida' => $validatedData['fk_licencia_requerida'],
-            'fk_certificacion_requerida' => $validatedData['fk_certificacion_requerida'], // Asignamos la única certificación
-            'pago_operador' => $validatedData['pago_operador'],
-            'estado' => 'PENDIENTE',  // Estado por defecto
-        ]);
+        return DB::transaction(function () use ($validatedData) {
 
-        return response()->json(['ok' => true, 'viaje' => $viaje]);
+            $certIds = $validatedData['certificaciones'];
+            unset($validatedData['certificaciones']);
+
+            // Crear el viaje
+            $viaje = Viaje::create([
+                'numero_viaje' => $validatedData['numero_viaje'],
+                'fk_ruta' => $validatedData['fk_ruta'],
+                'fk_licencia_requerida' => $validatedData['fk_licencia_requerida'],
+                'fk_operador' => $validatedData['fk_operador'] ?? null,
+                'fk_unidad' => $validatedData['fk_unidad'] ?? null,
+                'pago_operador' => $validatedData['pago_operador'],
+                'estado' => 'PENDIENTE',
+                'configuracion_unidad' => $validatedData['configuracion_unidad'],
+                'cliente' => $validatedData['cliente'],
+                'producto' => $validatedData['producto'],
+            ]);
+
+            // Filtrar las certificaciones por cliente
+            $clienteId = $validatedData['cliente'];
+            $certificaciones = Certificacion::where('fk_cliente', $clienteId)->get();
+
+            // Guardar certificaciones en pivote
+            $syncData = [];
+            foreach ($certificaciones as $certificacion) {
+                $syncData[$certificacion->id_certificacion] = ['obligatoria' => 1];
+            }
+
+            $viaje->certificaciones()->sync($syncData);
+
+            return response()->json([
+                'ok' => true,
+                'viaje' => Viaje::with(['ruta', 'licencia', 'certificaciones', 'operador', 'unidad'])
+                    ->find($viaje->id_viaje)
+            ], 201);
+        });
     }
 
     // Obtener un viaje por ID
     public function show($id)
     {
-        $viaje = Viaje::with(['ruta', 'licencia', 'certificaciones'])->find($id);
+        $viaje = Viaje::with(['ruta', 'licencia', 'certificaciones', 'operador', 'unidad'])->find($id);
 
         if (!$viaje) {
             return response()->json(['ok' => false, 'message' => 'Viaje no encontrado'], 404);
@@ -54,55 +87,79 @@ class AgregarViajeController extends Controller
         return response()->json(['ok' => true, 'viaje' => $viaje]);
     }
 
-    // Actualizar un viaje por ID
+    // Actualizar un viaje
     public function update(Request $request, $id)
     {
-        // Buscar el viaje a actualizar
         $viaje = Viaje::find($id);
 
         if (!$viaje) {
             return response()->json(['ok' => false, 'message' => 'Viaje no encontrado'], 404);
         }
 
-        // Validación de los datos recibidos
         $validatedData = $request->validate([
-            'numero_viaje' => 'required|string|max:30|unique:viaje,numero_viaje,' . $id,
+            'numero_viaje' => 'required|string|max:30|unique:viaje,numero_viaje,' . $id . ',id_viaje',
             'fk_ruta' => 'required|exists:ruta,id_ruta',
             'fk_licencia_requerida' => 'required|exists:licencia,id_licencia',
-            'fk_certificacion_requerida' => 'required|array',
-            'fk_certificacion_requerida.*' => 'integer|exists:certificacion,id_certificacion',
+            // ✅ MULTI CERT
+            'certificaciones' => 'sometimes|array|min:1',
+            'certificaciones.*' => 'integer|exists:certificacion,id_certificacion',
+            'configuracion_unidad' => 'sometimes|string|max:255',
+            'cliente' => 'sometimes|string|max:255',
+            'producto' => 'sometimes|string|max:255',
+            'fk_operador' => 'nullable|exists:operador,id_operador',
+            'fk_unidad' => 'nullable|exists:unidad,id_unidad',
             'pago_operador' => 'required|numeric|min:0',
             'estado' => 'nullable|string|in:PENDIENTE,ASIGNADO,EN_CURSO,TERMINADO,CANCELADO',
         ]);
 
-        // Actualizar el viaje
-        $viaje->update([
-            'numero_viaje' => $validatedData['numero_viaje'],
-            'fk_ruta' => $validatedData['fk_ruta'],
-            'fk_licencia_requerida' => $validatedData['fk_licencia_requerida'],
-            'pago_operador' => $validatedData['pago_operador'],
-            'estado' => $validatedData['estado'] ?? 'PENDIENTE',  // Si el estado no se pasa, se mantiene como 'PENDIENTE'
-        ]);
+        return DB::transaction(function () use ($viaje, $validatedData) {
 
-        // Actualizar las certificaciones asociadas
-        $viaje->certificaciones()->sync($validatedData['fk_certificacion_requerida']);  // Sincroniza las certificaciones
+            $certIds = $validatedData['certificaciones'] ?? null;
+            unset($validatedData['certificaciones']);
 
-        return response()->json(['ok' => true, 'viaje' => $viaje]);
+            $viaje->update([
+                'numero_viaje' => $validatedData['numero_viaje'],
+                'fk_ruta' => $validatedData['fk_ruta'],
+                'fk_licencia_requerida' => $validatedData['fk_licencia_requerida'],
+                'fk_operador' => $validatedData['fk_operador'] ?? null,
+                'fk_unidad' => $validatedData['fk_unidad'] ?? null,
+                'pago_operador' => $validatedData['pago_operador'],
+                'estado' => $validatedData['estado'] ?? $viaje->estado,
+                'configuracion_unidad' => $validatedData['configuracion_unidad'] ?? $viaje->configuracion_unidad,
+                'cliente' => $validatedData['cliente'] ?? $viaje->cliente,
+                'producto' => $validatedData['producto'] ?? $viaje->producto,
+            ]);
+
+            // Si mandan certificaciones, sincronizamos
+            if (is_array($certIds)) {
+                $syncData = [];
+                foreach ($certIds as $idCert) {
+                    $syncData[(int)$idCert] = ['obligatoria' => 1];
+                }
+                $viaje->certificaciones()->sync($syncData);
+            }
+
+            return response()->json([
+                'ok' => true,
+                'viaje' => Viaje::with(['ruta', 'licencia', 'certificaciones', 'operador', 'unidad'])
+                    ->find($viaje->id_viaje)
+            ]);
+        });
     }
 
-    // Eliminar un viaje por ID
     public function destroy($id)
     {
-        // Buscar el viaje a eliminar
         $viaje = Viaje::find($id);
 
         if (!$viaje) {
             return response()->json(['ok' => false, 'message' => 'Viaje no encontrado'], 404);
         }
 
-        // Eliminar el viaje
-        $viaje->delete();
+        return DB::transaction(function () use ($viaje) {
+            $viaje->certificaciones()->detach();
+            $viaje->delete();
 
-        return response()->json(['ok' => true, 'message' => 'Viaje eliminado con éxito']);
+            return response()->json(['ok' => true, 'message' => 'Viaje eliminado con éxito']);
+        });
     }
 }

@@ -36,12 +36,11 @@ class CertificacionController extends Controller
     // Agregar log para verificar los datos
     \Log::info('Actualizando certificación: ', $request->all());
 
-    $validated = $request->validate([
-        'nombre_certificacion' => 'required|string|max:255',
-        'descripcion' => 'required|string',
-        'fk_cliente' => 'required|exists:cliente,id_cliente',
-    ]);
-    
+   $validated = $request->validate([
+    'nombre_certificacion' => 'required|string|max:255',
+    'descripcion' => 'required|string',
+    'fk_cliente' => 'required|exists:cliente,id_cliente', // Validamos que fk_cliente exista
+]);
     $certificacion->update($validated);
 
     return $certificacion;

@@ -15,18 +15,22 @@ class OperadorCuota extends Model
     public $timestamps = false;
 
     protected $fillable = [
-        'fk_operador',
-        'periodo',
-        'cuota_objetivo',
-        'cuota_realizada',
-    ];
+    'fk_operador',
+    'periodo',
+    'fecha_inicio',  // ✅ nuevo
+    'fecha_fin',     // ✅ nuevo
+    'cuota_objetivo',
+    'cuota_realizada',
+];
 
-    protected $casts = [
-        'id_op_cuota' => 'integer',
-        'fk_operador' => 'integer',
-        'cuota_objetivo' => 'integer',
-        'cuota_realizada' => 'integer',
-    ];
+protected $casts = [
+    'id_op_cuota'    => 'integer',
+    'fk_operador'    => 'integer',
+    'cuota_objetivo' => 'integer',
+    'cuota_realizada'=> 'integer',
+    'fecha_inicio'   => 'date:Y-m-d',  // ✅ nuevo
+    'fecha_fin'      => 'date:Y-m-d',  // ✅ nuevo
+];
 
     protected $appends = [
         'cuota_restante',
@@ -70,4 +74,5 @@ class OperadorCuota extends Model
 {
     return $this->hasMany(\App\Models\OperadorCuota::class, 'fk_operador', 'id_operador');
 }
+
 }

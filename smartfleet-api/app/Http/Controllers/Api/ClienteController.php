@@ -15,4 +15,19 @@ class ClienteController extends Controller
         $clientes = Cliente::all();
         return response()->json($clientes);
     }
+
+
+
+    public function listadoSelector()
+{
+    $clientes = Cliente::where('activo', true)
+        ->select('id_cliente', 'nombre_cliente')
+        ->orderBy('nombre_cliente')
+        ->get();
+
+    return response()->json([
+        'ok'      => true,
+        'clientes' => $clientes
+    ]);
+}
 }

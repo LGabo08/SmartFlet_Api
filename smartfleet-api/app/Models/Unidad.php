@@ -11,7 +11,7 @@ class Unidad extends Model
 
     // Definir la tabla de la base de datos
     protected $table = 'unidad';
-
+     public $timestamps = false;  // Esto desactiva la gestión automática de las columnas created_at y updated_at
     // Definir la clave primaria
     protected $primaryKey = 'id_unidad';
 
@@ -25,7 +25,7 @@ class Unidad extends Model
         'estado',
         'fk_licencia_requerida',
     ];
-
+     
     // Relaciones con otras tablas
     public function zona()
     {

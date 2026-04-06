@@ -4,7 +4,7 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
-
+use App\Models\Scopes\UsuarioScope;
 class Operador extends Model
 {
     use HasFactory;
@@ -14,6 +14,7 @@ class Operador extends Model
     public $timestamps = false;
 
     protected $fillable = [
+        'fk_usuario',
         'numero_empleado',
         'nombres',
         'apellidos',
@@ -24,6 +25,17 @@ class Operador extends Model
         'fk_unidad_asignada',
     ];
 
+
+    protected static function booted(): void
+{
+    static::addGlobalScope(new UsuarioScope());
+
+    static::creating(function (self $model) {
+        if (auth('api')->check() && empty($model->fk_usuario)) {
+            $model->fk_usuario = auth('api')->id();
+        }
+    });
+}
     // Un operador puede tener muchos viajes
     public function viajes()
     {

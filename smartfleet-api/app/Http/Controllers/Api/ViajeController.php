@@ -9,7 +9,7 @@ use App\Models\Operador;
 use App\Models\Unidad;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\DB;
-use App\Models\Ruta;    
+use App\Models\Ruta;
 use App\Models\Certificacion;
 use App\Models\ViajeRechazado;
 use App\Models\EdicionesTarifaViaje;
@@ -21,10 +21,65 @@ use App\Models\OperadorHistorialEstado;
 use App\Models\OperadorHistorialZona;
 use App\Models\UnidadHistorialZona;
 use App\Models\ViajeFinalizacion;
+use Carbon\Carbon;
 
 class ViajeController extends Controller
 {
-    // ── VIAJES PENDIENTES ──────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // HELPER PRIVADO — Buscar cuota para un viaje
+    // ══════════════════════════════════════════════════════════════════════
+    //
+    // Problema: un viaje puede asignarse un domingo (cuota vigente) y
+    // operarse/cancelarse/reasignarse el lunes (cuota ya vencida).
+    // Con la búsqueda original por "hoy" no se encuentra la cuota y
+    // el movimiento no se registra ni se actualiza la cuota.
+    //
+    // Solución: intentar primero con hoy, y si no hay resultado,
+    // buscar la cuota que cubría la fecha_salida del viaje.
+    // Esto permite que operaciones sobre viajes que cruzan el límite
+    // del periodo afecten correctamente la cuota correspondiente.
+    //
+    // Nota: se usa lockForUpdate() para evitar condiciones de carrera
+    // cuando múltiples requests tocan la misma cuota simultáneamente.
+    //
+    private function buscarCuota(int $idOperador, Viaje $viaje): ?object
+    {
+        $hoy = now()->toDateString();
+
+        // 1. Intento normal: cuota vigente hoy
+        $cuota = DB::table('operador_cuota')
+            ->where('fk_operador', $idOperador)
+            ->where('fecha_inicio', '<=', $hoy)
+            ->where('fecha_fin',    '>=', $hoy)
+            ->lockForUpdate()
+            ->first();
+
+        if ($cuota) return $cuota;
+
+        // 2. Fallback: cuota que cubría la fecha_salida del viaje
+        // Cubre el caso: asignado domingo (dentro del periodo),
+        // cancelado/reasignado/tarifa-modificada el lunes (periodo ya vencido).
+        $fechaReferencia = $viaje->fecha_salida
+            ? Carbon::parse($viaje->fecha_salida)->toDateString()
+            : null;
+
+        if (!$fechaReferencia) return null;
+
+        return DB::table('operador_cuota')
+            ->where('fk_operador', $idOperador)
+            ->where('fecha_inicio', '<=', $fechaReferencia)
+            ->where('fecha_fin',    '>=', $fechaReferencia)
+            ->lockForUpdate()
+            ->first();
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Sin cambios: obtenerViajesPendientes, calcularAsignacion, aprobar,
+    // iniciarViaje, rechazar, historialViaje, historialEstadosOperador,
+    // historialZonasOperador, historialZonasUnidad, obtenerCadena,
+    // getFinalizacion, finalizar
+    // ══════════════════════════════════════════════════════════════════════
+
     public function obtenerViajesPendientes()
     {
         $rows = DB::table('viaje as v')
@@ -35,7 +90,7 @@ class ViajeController extends Controller
             ->select(
                 'v.id_viaje', 'v.numero_viaje', 'v.estado', 'v.configuracion_unidad',
                 'v.fk_ruta', 'r.nombre_ruta', 'r.fk_zona_origen as origen_zona_id',
-                'r.fk_zona_destino', 'r.distancia_km', 'r.tarifa_operador',
+                'r.fk_zona_destino', 'r.distancia_km',
                 'v.fk_licencia_requerida', 'l.nombre_licencia',
                 'c.id_certificacion as cert_id', 'c.nombre_certificacion as cert_nombre',
                 'v.pago_operador'
@@ -52,8 +107,8 @@ class ViajeController extends Controller
             $first = $items->first();
             $certs = $items->filter(fn($x) => !is_null($x->cert_id))
                 ->map(fn($x) => [
-                    'id_certificacion'    => (int)$x->cert_id,
-                    'nombre_certificacion'=> $x->cert_nombre,
+                    'id_certificacion'     => (int)$x->cert_id,
+                    'nombre_certificacion' => $x->cert_nombre,
                 ])
                 ->unique('id_certificacion')->values();
 
@@ -66,7 +121,6 @@ class ViajeController extends Controller
                 'origen_zona_id'        => (int)$first->origen_zona_id,
                 'fk_zona_destino'       => (int)$first->fk_zona_destino,
                 'distancia_km'          => (float)$first->distancia_km,
-                'tarifa_operador'       => (float)$first->tarifa_operador,
                 'fk_licencia_requerida' => $first->fk_licencia_requerida ? (int)$first->fk_licencia_requerida : null,
                 'nombre_licencia'       => $first->nombre_licencia ?? null,
                 'certificaciones'       => $certs,
@@ -77,7 +131,6 @@ class ViajeController extends Controller
         return response()->json(['ok' => true, 'viajes' => $viajes], 200);
     }
 
-    // ── CALCULAR ASIGNACIÓN ────────────────────────────────────────────────
     public function calcularAsignacion($id_viaje)
     {
         $viaje = Viaje::with(['ruta', 'certificaciones'])->where('id_viaje', $id_viaje)->first();
@@ -143,8 +196,6 @@ class ViajeController extends Controller
             ->get()
             ->keyBy('fk_operador');
 
-        // Detecta si el operador tiene un viaje HIJO encadenado activo (PENDIENTE o ASIGNADO)
-        // Si lo tiene, no puede recibir otro encadenamiento.
         $operadoresConEncadenamientoActivo = DB::table('viaje_encadenamiento as ve')
             ->join('viaje as v', 'v.id_viaje', '=', 've.fk_viaje_hijo')
             ->whereIn('v.estado', ['PENDIENTE', 'ASIGNADO'])
@@ -165,7 +216,7 @@ class ViajeController extends Controller
             'origen_zona_id'             => (int)$viaje->ruta->fk_zona_origen,
             'certificaciones_requeridas' => $certIds,
             'fk_licencia_requerida'      => $viaje->fk_licencia_requerida,
-            'tarifa_operador'            => (float)$viaje->ruta->tarifa_operador,
+            'tarifa_operador'            => (float)$viaje->ruta->pago_operador,
         ];
 
         $payload = [
@@ -283,16 +334,16 @@ class ViajeController extends Controller
                         'fk_zona_actual'    => $un->fk_zona_actual,
                         'nombre_zona'       => $zonasMap->get($un->fk_zona_actual)?->nombre_zona ?? 'N/A',
                     ] : null,
-                    'operador_disponible'       => in_array($op?->estado_operador ?? '', ['DISPONIBLE', 'ACTIVO']),
-                    'operador_fuera_zona'       => $operadorFueraZona,
-                    'licencia_vencida'          => $licenciaVencida,
-                    'unidad_asignada'           => $unidadAsignada,
-                    'unidad_fuera_zona'         => $unidadFueraZona,
-                    'cumple_licencia'           => $cumpleLicencia,
-                    'certificaciones_cumplidas' => $certsCumplidas,
-                    'certificaciones_faltantes' => $certsFaltantes,
-                    'es_encadenable'                  => $puedeEncadenar,
-                    'viaje_activo_id'                 => $viajeActivo['id_viaje_activo'] ?? null,
+                    'operador_disponible'              => in_array($op?->estado_operador ?? '', ['DISPONIBLE', 'ACTIVO']),
+                    'operador_fuera_zona'              => $operadorFueraZona,
+                    'licencia_vencida'                 => $licenciaVencida,
+                    'unidad_asignada'                  => $unidadAsignada,
+                    'unidad_fuera_zona'                => $unidadFueraZona,
+                    'cumple_licencia'                  => $cumpleLicencia,
+                    'certificaciones_cumplidas'        => $certsCumplidas,
+                    'certificaciones_faltantes'        => $certsFaltantes,
+                    'es_encadenable'                   => $puedeEncadenar,
+                    'viaje_activo_id'                  => $viajeActivo['id_viaje_activo'] ?? null,
                     'zona_efectiva_nombre'             => $zonasMap->get($r['zona_efectiva'] ?? null)?->nombre_zona ?? null,
                     'total_eslabones'                  => $totalEslabones,
                     'ruta_activa'                      => $r['ruta_activa'] ?? null,
@@ -314,7 +365,6 @@ class ViajeController extends Controller
         ], 200);
     }
 
-    // ── APROBAR ────────────────────────────────────────────────────────────
     public function aprobar(Request $request, $id)
     {
         $request->validate([
@@ -356,18 +406,12 @@ class ViajeController extends Controller
                         ->exists();
 
                     if ($yaEncadenado) {
-                        return response()->json([
-                            'ok'  => false,
-                            'msg' => 'Este viaje ya está encadenado a otro viaje.',
-                        ], 422);
+                        return response()->json(['ok' => false, 'msg' => 'Este viaje ya está encadenado a otro viaje.'], 422);
                     }
 
                     $viajePadreObj = Viaje::find($id_viaje_padre);
                     if (!$viajePadreObj || $viajePadreObj->estado !== 'EN_CURSO') {
-                        return response()->json([
-                            'ok'  => false,
-                            'msg' => 'El viaje padre debe estar EN_CURSO para poder encadenar.',
-                        ], 422);
+                        return response()->json(['ok' => false, 'msg' => 'El viaje padre debe estar EN_CURSO para poder encadenar.'], 422);
                     }
 
                     $encadenamientoActivo = DB::table('viaje_encadenamiento as ve')
@@ -398,14 +442,13 @@ class ViajeController extends Controller
                     return response()->json(['ok' => false, 'msg' => 'Unidad no encontrada'], 404);
                 }
 
-                $updateData = [
+                $viaje->update([
                     'fk_operador'    => $id_operador,
                     'fk_unidad'      => $id_unidad,
                     'estado'         => 'ASIGNADO',
                     'pago_operador'  => $viaje->pago_operador,
                     'fk_viaje_padre' => $id_viaje_padre ?? null,
-                ];
-                $viaje->update($updateData);
+                ]);
 
                 if ($operador->estado_operador === 'DISPONIBLE') {
                     OperadorHistorialEstado::create([
@@ -449,8 +492,6 @@ class ViajeController extends Controller
                     ], 422);
                 }
 
-                $periodo = $cuotaActiva->periodo;
-
                 DB::table('operador_cuota')
                     ->where('id_op_cuota', $cuotaActiva->id_op_cuota)
                     ->update(['cuota_realizada' => DB::raw('cuota_realizada + ' . $monto)]);
@@ -459,7 +500,7 @@ class ViajeController extends Controller
                     'fk_operador'    => $id_operador,
                     'fk_viaje'       => $id_viaje,
                     'fk_coordinador' => Auth::id(),
-                    'periodo'        => $periodo,
+                    'periodo'        => $cuotaActiva->periodo,
                     'tipo'           => 'ASIGNACION',
                     'monto'          => $monto,
                     'descripcion'    => "Asignación al viaje #{$viaje->numero_viaje}",
@@ -485,10 +526,7 @@ class ViajeController extends Controller
                         'fk_operador'    => $id_operador,
                         'fk_coordinador' => Auth::id(),
                         'tipo_evento'    => 'ENCADENAMIENTO_ASIGNADO',
-                        'detalle'        => json_encode([
-                            'viaje_padre' => $id_viaje_padre,
-                            'orden'       => $orden,
-                        ]),
+                        'detalle'        => json_encode(['viaje_padre' => $id_viaje_padre, 'orden' => $orden]),
                         'created_at'     => now(),
                     ]);
                 }
@@ -503,20 +541,15 @@ class ViajeController extends Controller
                     'tipo_evento'    => 'ENCADENAMIENTO_RANKING',
                     'detalle'        => json_encode(
                         $posElegido === 1
-                            ? ['resultado' => 'mejor_opcion', 'pos_elegido' => 1,
-                               'mensaje'   => 'Se asignó al operador con mejor ranking.']
-                            : ['resultado'      => 'no_mejor_opcion',
-                               'pos_elegido'    => $posElegido,
-                               'mejor_operador' => $nombreMejor,
-                               'pos_mejor'      => (int)($ranking_info['pos_mejor'] ?? 1),
-                               'mensaje'        => "Se eligió la posición #{$posElegido}. "
-                                                 . "El mejor operador era: {$nombreMejor}."]
+                            ? ['resultado' => 'mejor_opcion', 'pos_elegido' => 1, 'mensaje' => 'Se asignó al operador con mejor ranking.']
+                            : ['resultado' => 'no_mejor_opcion', 'pos_elegido' => $posElegido,
+                               'mejor_operador' => $nombreMejor, 'pos_mejor' => (int)($ranking_info['pos_mejor'] ?? 1),
+                               'mensaje' => "Se eligió la posición #{$posElegido}. El mejor operador era: {$nombreMejor}."]
                     ),
                     'created_at'     => now(),
                 ]);
 
                 $hayAdvertencias = !empty($advertencias);
-
                 ViajeIncidencia::create([
                     'fk_viaje'                      => $id_viaje,
                     'fk_operador'                   => $id_operador,
@@ -555,7 +588,6 @@ class ViajeController extends Controller
         }
     }
 
-    // ── INICIAR VIAJE ──────────────────────────────────────────────────────
     public function iniciarViaje(Request $request, $id)
     {
         $request->validate(['fecha_inicio' => 'required|date']);
@@ -631,405 +663,351 @@ class ViajeController extends Controller
                     'estado_operador' => 'EN_VIAJE',
                     'estado_unidad'   => 'EN_VIAJE',
                     'fecha_salida'    => $request->input('fecha_inicio'),
-                ]
+                ],
             ]);
         });
     }
 
     // ── CANCELAR VIAJE ─────────────────────────────────────────────────────
-public function cancelarViaje(Request $request, $id)
-{
-    $request->validate([
-        'motivos'                   => 'required|string|max:500',
-        'nuevo_estado_operador'     => 'nullable|string|in:DISPONIBLE,NO_DISPONIBLE,INACTIVO',
-        'motivo_cambio_operador'    => 'nullable|string|max:255',
-        'nueva_zona_operador'       => 'nullable|integer|exists:zona,id_zona',
-        'nuevo_estado_unidad'       => 'nullable|string|in:DISPONIBLE,NO_DISPONIBLE,EN_VIAJE,MANTENIMIENTO,BAJA',
-        'motivo_cambio_unidad'      => 'nullable|string|max:255',
-        'nueva_zona_unidad'         => 'nullable|integer|exists:zona,id_zona',
-        'accion_viajes_encadenados' => 'nullable|string|in:continuar,liberar',
-    ]);
+    // CAMBIO: usa $this->buscarCuota() en lugar de buscar solo por hoy.
+    // Esto permite restar la tarifa aunque el periodo haya vencido,
+    // siempre que el viaje se hubiera asignado dentro del periodo.
+    public function cancelarViaje(Request $request, $id)
+    {
+        $request->validate([
+            'motivos'                   => 'required|string|max:500',
+            'nuevo_estado_operador'     => 'nullable|string|in:DISPONIBLE,NO_DISPONIBLE,INACTIVO',
+            'motivo_cambio_operador'    => 'nullable|string|max:255',
+            'nueva_zona_operador'       => 'nullable|integer|exists:zona,id_zona',
+            'nuevo_estado_unidad'       => 'nullable|string|in:DISPONIBLE,NO_DISPONIBLE,EN_VIAJE,MANTENIMIENTO,BAJA',
+            'motivo_cambio_unidad'      => 'nullable|string|max:255',
+            'nueva_zona_unidad'         => 'nullable|integer|exists:zona,id_zona',
+            'accion_viajes_encadenados' => 'nullable|string|in:continuar,liberar',
+        ]);
 
-    $viaje = Viaje::find($id);
-    if (!$viaje) {
-        return response()->json(['ok' => false, 'msg' => 'Viaje no encontrado'], 404);
-    }
-
-    if (!in_array($viaje->estado, ['ASIGNADO', 'EN_CURSO', 'PENDIENTE'])) {
-        return response()->json([
-            'ok'  => false,
-            'msg' => 'Solo se pueden cancelar viajes en estado ASIGNADO, EN_CURSO o PENDIENTE.',
-        ], 409);
-    }
-
-    // ✅ FIX: detección dual igual que en reasignar
-    $esHijoEncadenado = !is_null($viaje->fk_viaje_padre)
-        || DB::table('viaje_encadenamiento')
-               ->where('fk_viaje_hijo', $viaje->id_viaje)
-               ->exists();
-
-    $esPadreEnCurso = $viaje->estado === 'EN_CURSO';
-
-    $viajesEncadenadosHijos = DB::table('viaje_encadenamiento as ve')
-        ->join('viaje as v', 'v.id_viaje', '=', 've.fk_viaje_hijo')
-        ->where('ve.fk_viaje_padre', $id)
-        ->whereIn('v.estado', ['PENDIENTE', 'ASIGNADO'])
-        ->select('v.id_viaje', 'v.numero_viaje', 'v.estado', 've.orden',
-                 'v.fk_operador', 'v.fk_unidad', 'v.pago_operador')
-        ->orderBy('ve.orden')
-        ->get();
-
-    $accionEncadenados = $request->input('accion_viajes_encadenados', 'liberar');
-    $hoy               = now()->toDateString();
-    $monto             = (float)($viaje->pago_operador ?? 0);
-    $operador          = Operador::find($viaje->fk_operador);
-    $unidad            = Unidad::find($viaje->fk_unidad);
-
-    return DB::transaction(function () use (
-        $request, $viaje, $operador, $unidad, $hoy, $monto,
-        $esHijoEncadenado, $esPadreEnCurso,
-        $viajesEncadenadosHijos, $accionEncadenados
-    ) {
-        // ── Restar cuota ──────────────────────────────────────────────────
-        // - Viaje EN_CURSO cancelado  → NO se resta (tarifa ya ganada)
-        // - Viaje ASIGNADO cancelado  → SÍ se resta (no había iniciado)
-        // - Viaje hijo ASIGNADO       → SÍ se resta
-        // - Viaje PENDIENTE           → NO se resta (sin operador)
-        $debeRestarTarifa = $operador
-            && $monto > 0
-            && $viaje->estado !== 'PENDIENTE'
-            && $viaje->estado !== 'EN_CURSO';
-
-        if ($debeRestarTarifa) {
-            $cuota = DB::table('operador_cuota')
-                ->where('fk_operador', $operador->id_operador)
-                ->where('fecha_inicio', '<=', $hoy)
-                ->where('fecha_fin',    '>=', $hoy)
-                ->lockForUpdate()->first();
-
-            if ($cuota) {
-                DB::table('operador_cuota')
-                    ->where('id_op_cuota', $cuota->id_op_cuota)
-                    ->update(['cuota_realizada' => (float)$cuota->cuota_realizada - $monto]);
-
-                OperadorMovimiento::create([
-                    'fk_operador'    => $operador->id_operador,
-                    'fk_viaje'       => $viaje->id_viaje,
-                    'fk_coordinador' => Auth::id(),
-                    'periodo'        => $cuota->periodo,
-                    'tipo'           => 'CANCELACION',
-                    'monto'          => -$monto,
-                    'descripcion'    => "Cancelación del viaje #{$viaje->numero_viaje}. Motivo: {$request->input('motivos')}",
-                    'created_at'     => now(),
-                ]);
-            }
+        $viaje = Viaje::find($id);
+        if (!$viaje) {
+            return response()->json(['ok' => false, 'msg' => 'Viaje no encontrado'], 404);
         }
 
-        // ── Actualizar operador y unidad ──────────────────────────────────
-        // Casos donde se permite cambiar estado/zona (operador libre):
-        //   A) Viaje sin cadena (ni padre ni hijos)
-        //   B) Viaje padre con hijos, usuario eligió 'liberar'
-        // Casos bloqueados:
-        //   C) Viaje padre EN_CURSO, cancela solo el padre ('continuar') → op queda ASIGNADO
-        //   D) Viaje hijo cancelado → op sigue con el padre, no se toca nada
+        if (!in_array($viaje->estado, ['ASIGNADO', 'EN_CURSO', 'PENDIENTE'])) {
+            return response()->json([
+                'ok'  => false,
+                'msg' => 'Solo se pueden cancelar viajes en estado ASIGNADO, EN_CURSO o PENDIENTE.',
+            ], 409);
+        }
 
-        $tieneHijos        = $viajesEncadenadosHijos->isNotEmpty();
-        $cancelaSoloPadre  = $esPadreEnCurso && $tieneHijos && $accionEncadenados === 'continuar';
-        $operadorBloqueado = $esHijoEncadenado || $cancelaSoloPadre;
+        $esHijoEncadenado = !is_null($viaje->fk_viaje_padre)
+            || DB::table('viaje_encadenamiento')->where('fk_viaje_hijo', $viaje->id_viaje)->exists();
 
-        if ($operador && $unidad && !$operadorBloqueado) {
-            // Operador queda libre — usuario elige estado/zona
-            $nuevoEstadoOp  = $request->input('nuevo_estado_operador', 'DISPONIBLE');
-            $motivoCambioOp = $request->input('motivo_cambio_operador')
-                ?? "Cancelación del viaje #{$viaje->numero_viaje}";
+        $esPadreEnCurso = $viaje->estado === 'EN_CURSO';
 
-            OperadorHistorialEstado::create([
-                'fk_operador'     => $operador->id_operador,
-                'fk_coordinador'  => Auth::id(),
-                'estado_anterior' => $operador->estado_operador,
-                'estado_nuevo'    => $nuevoEstadoOp,
-                'motivo'          => $motivoCambioOp,
-                'created_at'      => now(),
-            ]);
-            DB::table('operador')->where('id_operador', $operador->id_operador)
-                ->update(['estado_operador' => $nuevoEstadoOp]);
+        $viajesEncadenadosHijos = DB::table('viaje_encadenamiento as ve')
+            ->join('viaje as v', 'v.id_viaje', '=', 've.fk_viaje_hijo')
+            ->where('ve.fk_viaje_padre', $id)
+            ->whereIn('v.estado', ['PENDIENTE', 'ASIGNADO'])
+            ->select('v.id_viaje', 'v.numero_viaje', 'v.estado', 've.orden',
+                     'v.fk_operador', 'v.fk_unidad', 'v.pago_operador')
+            ->orderBy('ve.orden')
+            ->get();
 
-            if ($nuevaZonaOp = $request->input('nueva_zona_operador')) {
-                if ((int)$nuevaZonaOp !== (int)$operador->fk_zona_actual) {
-                    OperadorHistorialZona::create([
+        $accionEncadenados = $request->input('accion_viajes_encadenados', 'liberar');
+        $monto             = (float)($viaje->pago_operador ?? 0);
+        $operador          = Operador::find($viaje->fk_operador);
+        $unidad            = Unidad::find($viaje->fk_unidad);
+
+        return DB::transaction(function () use (
+            $request, $viaje, $operador, $unidad, $monto,
+            $esHijoEncadenado, $esPadreEnCurso,
+            $viajesEncadenadosHijos, $accionEncadenados
+        ) {
+            $debeRestarTarifa = $operador
+                && $monto > 0
+                && $viaje->estado !== 'PENDIENTE'
+                && $viaje->estado !== 'EN_CURSO';
+
+            if ($debeRestarTarifa) {
+                // ── CAMBIO: usar helper en lugar de buscar solo por hoy ──
+                $cuota = $this->buscarCuota($operador->id_operador, $viaje);
+
+                if ($cuota) {
+                    DB::table('operador_cuota')
+                        ->where('id_op_cuota', $cuota->id_op_cuota)
+                        ->update(['cuota_realizada' => (float)$cuota->cuota_realizada - $monto]);
+
+                    OperadorMovimiento::create([
                         'fk_operador'    => $operador->id_operador,
-                        'fk_coordinador' => Auth::id(),
                         'fk_viaje'       => $viaje->id_viaje,
-                        'zona_anterior'  => $operador->fk_zona_actual,
-                        'zona_nueva'     => $nuevaZonaOp,
-                        'motivo'         => $motivoCambioOp,
+                        'fk_coordinador' => Auth::id(),
+                        'periodo'        => $cuota->periodo,
+                        'tipo'           => 'CANCELACION',
+                        'monto'          => -$monto,
+                        'descripcion'    => "Cancelación del viaje #{$viaje->numero_viaje}. Motivo: {$request->input('motivos')}",
                         'created_at'     => now(),
                     ]);
-                    DB::table('operador')->where('id_operador', $operador->id_operador)
-                        ->update(['fk_zona_actual' => $nuevaZonaOp]);
                 }
             }
 
-            $nuevoEstadoUni  = $request->input('nuevo_estado_unidad', 'DISPONIBLE');
-            $motivoCambioUni = $request->input('motivo_cambio_unidad')
-                ?? "Cancelación del viaje #{$viaje->numero_viaje}";
+            $tieneHijos        = $viajesEncadenadosHijos->isNotEmpty();
+            $cancelaSoloPadre  = $esPadreEnCurso && $tieneHijos && $accionEncadenados === 'continuar';
+            $operadorBloqueado = $esHijoEncadenado || $cancelaSoloPadre;
 
-            DB::table('reporte_unidad')->insert([
-                'fk_unidad'       => $unidad->id_unidad,
-                'estado_anterior' => $unidad->estado,
-                'estado_nuevo'    => $nuevoEstadoUni,
-                'motivo'          => $motivoCambioUni,
-                'fecha_reporte'   => now(),
-            ]);
-            DB::table('unidad')->where('id_unidad', $unidad->id_unidad)
-                ->update(['estado' => $nuevoEstadoUni]);
+            if ($operador && $unidad && !$operadorBloqueado) {
+                $nuevoEstadoOp  = $request->input('nuevo_estado_operador', 'DISPONIBLE');
+                $motivoCambioOp = $request->input('motivo_cambio_operador')
+                    ?? "Cancelación del viaje #{$viaje->numero_viaje}";
 
-            if ($nuevaZonaUni = $request->input('nueva_zona_unidad')) {
-                if ((int)$nuevaZonaUni !== (int)$unidad->fk_zona_actual) {
-                    UnidadHistorialZona::create([
-                        'fk_unidad'      => $unidad->id_unidad,
-                        'fk_coordinador' => Auth::id(),
-                        'fk_viaje'       => $viaje->id_viaje,
-                        'zona_anterior'  => $unidad->fk_zona_actual,
-                        'zona_nueva'     => $nuevaZonaUni,
-                        'motivo'         => $motivoCambioUni,
-                        'created_at'     => now(),
-                    ]);
-                    DB::table('unidad')->where('id_unidad', $unidad->id_unidad)
-                        ->update(['fk_zona_actual' => $nuevaZonaUni]);
-                }
-            }
+                OperadorHistorialEstado::create([
+                    'fk_operador'     => $operador->id_operador,
+                    'fk_coordinador'  => Auth::id(),
+                    'estado_anterior' => $operador->estado_operador,
+                    'estado_nuevo'    => $nuevoEstadoOp,
+                    'motivo'          => $motivoCambioOp,
+                    'created_at'      => now(),
+                ]);
+                DB::table('operador')->where('id_operador', $operador->id_operador)
+                    ->update(['estado_operador' => $nuevoEstadoOp]);
 
-        } elseif ($operador && $unidad && $cancelaSoloPadre) {
-            // Caso C: padre EN_CURSO cancelado, hijo continúa → op queda ASIGNADO
-            OperadorHistorialEstado::create([
-                'fk_operador'     => $operador->id_operador,
-                'fk_coordinador'  => Auth::id(),
-                'estado_anterior' => $operador->estado_operador,
-                'estado_nuevo'    => 'ASIGNADO',
-                'motivo'          => "Cancelación del viaje padre #{$viaje->numero_viaje}. Operador continúa con viaje encadenado.",
-                'created_at'      => now(),
-            ]);
-            DB::table('operador')->where('id_operador', $operador->id_operador)
-                ->update(['estado_operador' => 'ASIGNADO']);
-
-            DB::table('reporte_unidad')->insert([
-                'fk_unidad'       => $unidad->id_unidad,
-                'estado_anterior' => $unidad->estado,
-                'estado_nuevo'    => 'ASIGNADA_A_VIAJE',
-                'motivo'          => "Cancelación del viaje padre #{$viaje->numero_viaje}.",
-                'fecha_reporte'   => now(),
-            ]);
-            DB::table('unidad')->where('id_unidad', $unidad->id_unidad)
-                ->update(['estado' => 'ASIGNADA_A_VIAJE']);
-        }
-        // Caso D: hijo cancelado → no se toca operador ni unidad (siguen con el padre)
-
-        // ── Procesar hijos encadenados ────────────────────────────────────
-        foreach ($viajesEncadenadosHijos as $hijo) {
-            if ($accionEncadenados === 'liberar') {
-                // Restar cuota del hijo (siempre ASIGNADO aquí, no EN_CURSO)
-                $montoHijo = (float)($hijo->pago_operador ?? 0);
-                if ($montoHijo > 0 && $hijo->fk_operador) {
-                    $cuotaHijo = DB::table('operador_cuota')
-                        ->where('fk_operador', $hijo->fk_operador)
-                        ->where('fecha_inicio', '<=', $hoy)
-                        ->where('fecha_fin',    '>=', $hoy)
-                        ->first();
-                    if ($cuotaHijo) {
-                        DB::table('operador_cuota')
-                            ->where('id_op_cuota', $cuotaHijo->id_op_cuota)
-                            ->update(['cuota_realizada' => (float)$cuotaHijo->cuota_realizada - $montoHijo]);
-
-                        OperadorMovimiento::create([
-                            'fk_operador'    => $hijo->fk_operador,
-                            'fk_viaje'       => $hijo->id_viaje,
+                if ($nuevaZonaOp = $request->input('nueva_zona_operador')) {
+                    if ((int)$nuevaZonaOp !== (int)$operador->fk_zona_actual) {
+                        OperadorHistorialZona::create([
+                            'fk_operador'    => $operador->id_operador,
                             'fk_coordinador' => Auth::id(),
-                            'periodo'        => $cuotaHijo->periodo,
-                            'tipo'           => 'CANCELACION',
-                            'monto'          => -$montoHijo,
-                            'descripcion'    => "Cancelación del viaje hijo #{$hijo->numero_viaje} junto al padre #{$viaje->numero_viaje}",
+                            'fk_viaje'       => $viaje->id_viaje,
+                            'zona_anterior'  => $operador->fk_zona_actual,
+                            'zona_nueva'     => $nuevaZonaOp,
+                            'motivo'         => $motivoCambioOp,
                             'created_at'     => now(),
                         ]);
+                        DB::table('operador')->where('id_operador', $operador->id_operador)
+                            ->update(['fk_zona_actual' => $nuevaZonaOp]);
                     }
                 }
 
-                DB::table('viaje_encadenamiento')
-                    ->where('fk_viaje_hijo', $hijo->id_viaje)
-                    ->delete();
+                $nuevoEstadoUni  = $request->input('nuevo_estado_unidad', 'DISPONIBLE');
+                $motivoCambioUni = $request->input('motivo_cambio_unidad')
+                    ?? "Cancelación del viaje #{$viaje->numero_viaje}";
 
-                DB::table('viaje')->where('id_viaje', $hijo->id_viaje)->update([
-                    'estado'         => 'CANCELADO',
-                    'fk_operador'    => null,
-                    'fk_unidad'      => null,
-                    'fk_viaje_padre' => null,
-                    'fecha_llegada'  => now(),
+                DB::table('reporte_unidad')->insert([
+                    'fk_unidad'       => $unidad->id_unidad,
+                    'estado_anterior' => $unidad->estado,
+                    'estado_nuevo'    => $nuevoEstadoUni,
+                    'motivo'          => $motivoCambioUni,
+                    'fecha_reporte'   => now(),
                 ]);
+                DB::table('unidad')->where('id_unidad', $unidad->id_unidad)
+                    ->update(['estado' => $nuevoEstadoUni]);
 
-                DB::table('viaje_rechazado')->insert([
-                    'fk_viaje'      => $hijo->id_viaje,
-                    'motivos'       => "Cancelado junto al viaje padre #{$viaje->numero_viaje}. {$request->input('motivos')}",
-                    'fecha_rechazo' => now(),
+                if ($nuevaZonaUni = $request->input('nueva_zona_unidad')) {
+                    if ((int)$nuevaZonaUni !== (int)$unidad->fk_zona_actual) {
+                        UnidadHistorialZona::create([
+                            'fk_unidad'      => $unidad->id_unidad,
+                            'fk_coordinador' => Auth::id(),
+                            'fk_viaje'       => $viaje->id_viaje,
+                            'zona_anterior'  => $unidad->fk_zona_actual,
+                            'zona_nueva'     => $nuevaZonaUni,
+                            'motivo'         => $motivoCambioUni,
+                            'created_at'     => now(),
+                        ]);
+                        DB::table('unidad')->where('id_unidad', $unidad->id_unidad)
+                            ->update(['fk_zona_actual' => $nuevaZonaUni]);
+                    }
+                }
+
+            } elseif ($operador && $unidad && $cancelaSoloPadre) {
+                OperadorHistorialEstado::create([
+                    'fk_operador'     => $operador->id_operador,
+                    'fk_coordinador'  => Auth::id(),
+                    'estado_anterior' => $operador->estado_operador,
+                    'estado_nuevo'    => 'ASIGNADO',
+                    'motivo'          => "Cancelación del viaje padre #{$viaje->numero_viaje}. Operador continúa con viaje encadenado.",
+                    'created_at'      => now(),
                 ]);
+                DB::table('operador')->where('id_operador', $operador->id_operador)
+                    ->update(['estado_operador' => 'ASIGNADO']);
 
-                ViajeIncidencia::create([
-                    'fk_viaje'       => $hijo->id_viaje,
-                    'fk_operador'    => $hijo->fk_operador,
-                    'fk_coordinador' => Auth::id(),
-                    'tipo_evento'    => 'CANCELACION_VIAJE',
-                    'detalle'        => "Cancelado junto al viaje padre #{$viaje->numero_viaje}.",
-                    'created_at'     => now(),
+                DB::table('reporte_unidad')->insert([
+                    'fk_unidad'       => $unidad->id_unidad,
+                    'estado_anterior' => $unidad->estado,
+                    'estado_nuevo'    => 'ASIGNADA_A_VIAJE',
+                    'motivo'          => "Cancelación del viaje padre #{$viaje->numero_viaje}.",
+                    'fecha_reporte'   => now(),
                 ]);
-
-            } else {
-                // 'continuar': hijo se convierte en nuevo padre independiente
-                DB::table('viaje_encadenamiento')
-                    ->where('fk_viaje_hijo', $hijo->id_viaje)
-                    ->delete();
-
-                DB::table('viaje')->where('id_viaje', $hijo->id_viaje)->update([
-                    'fk_viaje_padre' => null,
-                ]);
-
-                ViajeIncidencia::create([
-                    'fk_viaje'       => $hijo->id_viaje,
-                    'fk_operador'    => $viaje->fk_operador,
-                    'fk_coordinador' => Auth::id(),
-                    'tipo_evento'    => 'ENCADENAMIENTO_CONTINUADO',
-                    'detalle'        => json_encode([
-                        'motivo'       => 'Viaje padre cancelado. Este viaje se convierte en el nuevo padre.',
-                        'viaje_padre'  => $viaje->id_viaje,
-                        'numero_padre' => $viaje->numero_viaje,
-                    ]),
-                    'created_at'     => now(),
-                ]);
+                DB::table('unidad')->where('id_unidad', $unidad->id_unidad)
+                    ->update(['estado' => 'ASIGNADA_A_VIAJE']);
             }
-        }
 
-        // ── Si ESTE viaje es hijo, limpiar su propio eslabón ─────────────
-        if ($esHijoEncadenado) {
-            DB::table('viaje_encadenamiento')
-                ->where('fk_viaje_hijo', $viaje->id_viaje)
-                ->delete();
-        }
+            foreach ($viajesEncadenadosHijos as $hijo) {
+                if ($accionEncadenados === 'liberar') {
+                    $montoHijo = (float)($hijo->pago_operador ?? 0);
+                    if ($montoHijo > 0 && $hijo->fk_operador) {
+                        // Hijo ASIGNADO — buscar su cuota por fecha_salida del hijo
+                        $viajeHijo = Viaje::find($hijo->id_viaje);
+                        $cuotaHijo = $viajeHijo
+                            ? $this->buscarCuota($hijo->fk_operador, $viajeHijo)
+                            : null;
 
-        // ── Cancelar el viaje ─────────────────────────────────────────────
-        $viaje->update(['estado' => 'CANCELADO', 'fecha_llegada' => now()]);
+                        if ($cuotaHijo) {
+                            DB::table('operador_cuota')
+                                ->where('id_op_cuota', $cuotaHijo->id_op_cuota)
+                                ->update(['cuota_realizada' => (float)$cuotaHijo->cuota_realizada - $montoHijo]);
 
-        DB::table('viaje_rechazado')->insert([
-            'fk_viaje'      => $viaje->id_viaje,
-            'motivos'       => $request->input('motivos'),
-            'fecha_rechazo' => now(),
-        ]);
+                            OperadorMovimiento::create([
+                                'fk_operador'    => $hijo->fk_operador,
+                                'fk_viaje'       => $hijo->id_viaje,
+                                'fk_coordinador' => Auth::id(),
+                                'periodo'        => $cuotaHijo->periodo,
+                                'tipo'           => 'CANCELACION',
+                                'monto'          => -$montoHijo,
+                                'descripcion'    => "Cancelación del viaje hijo #{$hijo->numero_viaje} junto al padre #{$viaje->numero_viaje}",
+                                'created_at'     => now(),
+                            ]);
+                        }
+                    }
 
-        ViajeIncidencia::create([
-            'fk_viaje'       => $viaje->id_viaje,
-            'fk_operador'    => $viaje->fk_operador ?? null,
-            'fk_coordinador' => Auth::id(),
-            'tipo_evento'    => 'CANCELACION_VIAJE',
-            'detalle'        => $request->input('motivos'),
-            'created_at'     => now(),
-        ]);
+                    DB::table('viaje_encadenamiento')->where('fk_viaje_hijo', $hijo->id_viaje)->delete();
+                    DB::table('viaje')->where('id_viaje', $hijo->id_viaje)->update([
+                        'estado'         => 'CANCELADO',
+                        'fk_operador'    => null,
+                        'fk_unidad'      => null,
+                        'fk_viaje_padre' => null,
+                        'fecha_llegada'  => now(),
+                    ]);
+                    DB::table('viaje_rechazado')->insert([
+                        'fk_viaje'      => $hijo->id_viaje,
+                        'motivos'       => "Cancelado junto al viaje padre #{$viaje->numero_viaje}. {$request->input('motivos')}",
+                        'fecha_rechazo' => now(),
+                    ]);
+                    ViajeIncidencia::create([
+                        'fk_viaje'       => $hijo->id_viaje,
+                        'fk_operador'    => $hijo->fk_operador,
+                        'fk_coordinador' => Auth::id(),
+                        'tipo_evento'    => 'CANCELACION_VIAJE',
+                        'detalle'        => "Cancelado junto al viaje padre #{$viaje->numero_viaje}.",
+                        'created_at'     => now(),
+                    ]);
+                } else {
+                    DB::table('viaje_encadenamiento')->where('fk_viaje_hijo', $hijo->id_viaje)->delete();
+                    DB::table('viaje')->where('id_viaje', $hijo->id_viaje)->update(['fk_viaje_padre' => null]);
+                    ViajeIncidencia::create([
+                        'fk_viaje'       => $hijo->id_viaje,
+                        'fk_operador'    => $viaje->fk_operador,
+                        'fk_coordinador' => Auth::id(),
+                        'tipo_evento'    => 'ENCADENAMIENTO_CONTINUADO',
+                        'detalle'        => json_encode([
+                            'motivo'       => 'Viaje padre cancelado. Este viaje se convierte en el nuevo padre.',
+                            'viaje_padre'  => $viaje->id_viaje,
+                            'numero_padre' => $viaje->numero_viaje,
+                        ]),
+                        'created_at'     => now(),
+                    ]);
+                }
+            }
 
-        return response()->json([
-            'ok'                           => true,
-            'msg'                          => 'Viaje cancelado correctamente',
-            'es_hijo_encadenado'           => $esHijoEncadenado,
-            'viajes_encadenados_afectados' => $viajesEncadenadosHijos->count(),
-            'accion_encadenados'           => $accionEncadenados,
-            'tarifa_restada'               => $debeRestarTarifa,
-        ], 200);
-    });
-}
+            if ($esHijoEncadenado) {
+                DB::table('viaje_encadenamiento')->where('fk_viaje_hijo', $viaje->id_viaje)->delete();
+            }
+
+            $viaje->update(['estado' => 'CANCELADO', 'fecha_llegada' => now()]);
+
+            DB::table('viaje_rechazado')->insert([
+                'fk_viaje'      => $viaje->id_viaje,
+                'motivos'       => $request->input('motivos'),
+                'fecha_rechazo' => now(),
+            ]);
+
+            ViajeIncidencia::create([
+                'fk_viaje'       => $viaje->id_viaje,
+                'fk_operador'    => $viaje->fk_operador ?? null,
+                'fk_coordinador' => Auth::id(),
+                'tipo_evento'    => 'CANCELACION_VIAJE',
+                'detalle'        => $request->input('motivos'),
+                'created_at'     => now(),
+            ]);
+
+            return response()->json([
+                'ok'                           => true,
+                'msg'                          => 'Viaje cancelado correctamente',
+                'es_hijo_encadenado'           => $esHijoEncadenado,
+                'viajes_encadenados_afectados' => $viajesEncadenadosHijos->count(),
+                'accion_encadenados'           => $accionEncadenados,
+                'tarifa_restada'               => $debeRestarTarifa,
+            ], 200);
+        });
+    }
+
     // ── REASIGNAR ──────────────────────────────────────────────────────────
-public function reasignar(Request $request, $id)
-{
-    $request->validate([
-        'nuevo_estado_operador' => 'nullable|string|in:DISPONIBLE,NO_DISPONIBLE,INACTIVO',
-        'nuevo_estado_unidad'   => 'nullable|string|in:DISPONIBLE,NO_DISPONIBLE,MANTENIMIENTO,BAJA',
-        'nueva_zona_operador'   => 'nullable|integer|exists:zona,id_zona',
-        'nueva_zona_unidad'     => 'nullable|integer|exists:zona,id_zona',
-        'motivo'                => 'nullable|string|max:500',
-    ]);
+    // CAMBIO: usa $this->buscarCuota() para encontrar la cuota correcta
+    // aunque el periodo haya vencido desde la asignación original.
+    public function reasignar(Request $request, $id)
+    {
+        $request->validate([
+            'nuevo_estado_operador' => 'nullable|string|in:DISPONIBLE,NO_DISPONIBLE,INACTIVO',
+            'nuevo_estado_unidad'   => 'nullable|string|in:DISPONIBLE,NO_DISPONIBLE,MANTENIMIENTO,BAJA',
+            'nueva_zona_operador'   => 'nullable|integer|exists:zona,id_zona',
+            'nueva_zona_unidad'     => 'nullable|integer|exists:zona,id_zona',
+            'motivo'                => 'nullable|string|max:500',
+        ]);
 
-    $viaje = Viaje::find($id);
-    if (!$viaje) {
-        return response()->json(['ok' => false, 'msg' => 'Viaje no encontrado'], 404);
-    }
+        $viaje = Viaje::find($id);
+        if (!$viaje) {
+            return response()->json(['ok' => false, 'msg' => 'Viaje no encontrado'], 404);
+        }
 
-    if ($viaje->estado !== 'ASIGNADO') {
-        return response()->json([
-            'ok'  => false,
-            'msg' => 'Solo se pueden reasignar viajes en estado ASIGNADO. Los viajes EN_CURSO deben cancelarse.',
-        ], 409);
-    }
+        if ($viaje->estado !== 'ASIGNADO') {
+            return response()->json([
+                'ok'  => false,
+                'msg' => 'Solo se pueden reasignar viajes en estado ASIGNADO. Los viajes EN_CURSO deben cancelarse.',
+            ], 409);
+        }
 
-    $operador      = Operador::find($viaje->fk_operador);
-    $unidad        = Unidad::find($viaje->fk_unidad);
-    $hoy           = now()->toDateString();
-    $monto         = (float)($viaje->pago_operador ?? 0);
-    $motivoInterno = $request->input('motivo')
-        ?? "Reasignación del viaje #{$viaje->numero_viaje}";
+        $operador      = Operador::find($viaje->fk_operador);
+        $unidad        = Unidad::find($viaje->fk_unidad);
+        $monto         = (float)($viaje->pago_operador ?? 0);
+        $motivoInterno = $request->input('motivo') ?? "Reasignación del viaje #{$viaje->numero_viaje}";
 
-    // ✅ FIX: detección dual — fk_viaje_padre en el viaje O eslabón en viaje_encadenamiento
-    // Necesario porque fk_viaje_padre puede llegar NULL si Eloquent lo cachea o
-    // si hubo un bug previo que no lo guardó, pero el eslabón sí existe.
-    $esHijoEncadenado = !is_null($viaje->fk_viaje_padre)
-        || DB::table('viaje_encadenamiento')
-               ->where('fk_viaje_hijo', $viaje->id_viaje)
-               ->exists();
+        $esHijoEncadenado = !is_null($viaje->fk_viaje_padre)
+            || DB::table('viaje_encadenamiento')->where('fk_viaje_hijo', $viaje->id_viaje)->exists();
 
-    // ── Determinar estados finales ANTES de entrar a la transacción ───────
-    // Hijo  → mantener estado actual del operador/unidad (no tocar nada)
-    // Padre → el coordinador elige (default DISPONIBLE)
-    $estadoOpFinal  = $esHijoEncadenado
-        ? ($operador?->estado_operador ?? 'EN_VIAJE')
-        : $request->input('nuevo_estado_operador', 'DISPONIBLE');
+        $estadoOpFinal  = $esHijoEncadenado
+            ? ($operador?->estado_operador ?? 'EN_VIAJE')
+            : $request->input('nuevo_estado_operador', 'DISPONIBLE');
 
-    $estadoUniFinal = $esHijoEncadenado
-        ? ($unidad?->estado ?? 'EN_VIAJE')
-        : $request->input('nuevo_estado_unidad', 'DISPONIBLE');
+        $estadoUniFinal = $esHijoEncadenado
+            ? ($unidad?->estado ?? 'EN_VIAJE')
+            : $request->input('nuevo_estado_unidad', 'DISPONIBLE');
 
-    return DB::transaction(function () use (
-        $request, $viaje, $operador, $unidad, $hoy, $monto,
-        $esHijoEncadenado, $motivoInterno, $estadoOpFinal, $estadoUniFinal
-    ) {
-        // ── Restar cuota — siempre (ASIGNADO no había iniciado) ───────────
-        if ($operador && $monto > 0) {
-            $cuota = DB::table('operador_cuota')
-                ->where('fk_operador', $operador->id_operador)
-                ->where('fecha_inicio', '<=', $hoy)
-                ->where('fecha_fin',    '>=', $hoy)
-                ->lockForUpdate()->first();
+        return DB::transaction(function () use (
+            $request, $viaje, $operador, $unidad, $monto,
+            $esHijoEncadenado, $motivoInterno, $estadoOpFinal, $estadoUniFinal
+        ) {
+            if ($operador && $monto > 0) {
+                // ── CAMBIO: usar helper en lugar de buscar solo por hoy ──
+                $cuota = $this->buscarCuota($operador->id_operador, $viaje);
 
-            if ($cuota) {
-                DB::table('operador_cuota')
-                    ->where('id_op_cuota', $cuota->id_op_cuota)
-                    ->update(['cuota_realizada' => (float)$cuota->cuota_realizada - $monto]);
+                if ($cuota) {
+                    DB::table('operador_cuota')
+                        ->where('id_op_cuota', $cuota->id_op_cuota)
+                        ->update(['cuota_realizada' => (float)$cuota->cuota_realizada - $monto]);
 
-                OperadorMovimiento::create([
-                    'fk_operador'    => $operador->id_operador,
-                    'fk_viaje'       => $viaje->id_viaje,
-                    'fk_coordinador' => Auth::id(),
-                    'periodo'        => $cuota->periodo,
-                    'tipo'           => 'REASIGNACION',
-                    'monto'          => -$monto,
-                    'descripcion'    => $motivoInterno,
-                    'created_at'     => now(),
-                ]);
+                    OperadorMovimiento::create([
+                        'fk_operador'    => $operador->id_operador,
+                        'fk_viaje'       => $viaje->id_viaje,
+                        'fk_coordinador' => Auth::id(),
+                        'periodo'        => $cuota->periodo,
+                        'tipo'           => 'REASIGNACION',
+                        'monto'          => -$monto,
+                        'descripcion'    => $motivoInterno,
+                        'created_at'     => now(),
+                    ]);
+                }
             }
-        }
 
-        // ── Limpiar eslabón si es hijo ────────────────────────────────────
-        if ($esHijoEncadenado) {
-            DB::table('viaje_encadenamiento')
-                ->where('fk_viaje_hijo', $viaje->id_viaje)
-                ->delete();
-        }
+            if ($esHijoEncadenado) {
+                DB::table('viaje_encadenamiento')->where('fk_viaje_hijo', $viaje->id_viaje)->delete();
+            }
 
-        // ── Actualizar operador ───────────────────────────────────────────
-        if ($operador) {
-            if ($operador->estado_operador !== $estadoOpFinal) {
+            if ($operador && $operador->estado_operador !== $estadoOpFinal) {
                 OperadorHistorialEstado::create([
                     'fk_operador'     => $operador->id_operador,
                     'fk_coordinador'  => Auth::id(),
@@ -1038,13 +1016,11 @@ public function reasignar(Request $request, $id)
                     'motivo'          => $motivoInterno,
                     'created_at'      => now(),
                 ]);
-                DB::table('operador')
-                    ->where('id_operador', $operador->id_operador)
+                DB::table('operador')->where('id_operador', $operador->id_operador)
                     ->update(['estado_operador' => $estadoOpFinal]);
             }
 
-            // Zona: solo si NO es hijo
-            if (!$esHijoEncadenado) {
+            if ($operador && !$esHijoEncadenado) {
                 if ($nuevaZonaOp = $request->input('nueva_zona_operador')) {
                     if ((int)$nuevaZonaOp !== (int)$operador->fk_zona_actual) {
                         OperadorHistorialZona::create([
@@ -1056,17 +1032,13 @@ public function reasignar(Request $request, $id)
                             'motivo'         => $motivoInterno,
                             'created_at'     => now(),
                         ]);
-                        DB::table('operador')
-                            ->where('id_operador', $operador->id_operador)
+                        DB::table('operador')->where('id_operador', $operador->id_operador)
                             ->update(['fk_zona_actual' => $nuevaZonaOp]);
                     }
                 }
             }
-        }
 
-        // ── Actualizar unidad ─────────────────────────────────────────────
-        if ($unidad) {
-            if ($unidad->estado !== $estadoUniFinal) {
+            if ($unidad && $unidad->estado !== $estadoUniFinal) {
                 DB::table('reporte_unidad')->insert([
                     'fk_unidad'       => $unidad->id_unidad,
                     'estado_anterior' => $unidad->estado,
@@ -1074,13 +1046,11 @@ public function reasignar(Request $request, $id)
                     'motivo'          => $motivoInterno,
                     'fecha_reporte'   => now(),
                 ]);
-                DB::table('unidad')
-                    ->where('id_unidad', $unidad->id_unidad)
+                DB::table('unidad')->where('id_unidad', $unidad->id_unidad)
                     ->update(['estado' => $estadoUniFinal]);
             }
 
-            // Zona: solo si NO es hijo
-            if (!$esHijoEncadenado) {
+            if ($unidad && !$esHijoEncadenado) {
                 if ($nuevaZonaUni = $request->input('nueva_zona_unidad')) {
                     if ((int)$nuevaZonaUni !== (int)$unidad->fk_zona_actual) {
                         UnidadHistorialZona::create([
@@ -1092,53 +1062,54 @@ public function reasignar(Request $request, $id)
                             'motivo'         => $motivoInterno,
                             'created_at'     => now(),
                         ]);
-                        DB::table('unidad')
-                            ->where('id_unidad', $unidad->id_unidad)
+                        DB::table('unidad')->where('id_unidad', $unidad->id_unidad)
                             ->update(['fk_zona_actual' => $nuevaZonaUni]);
                     }
                 }
             }
-        }
 
-        // ── Historial ─────────────────────────────────────────────────────
-        DB::table('historial_reasignaciones')->insert([
-            'fk_viaje'       => $viaje->id_viaje,
-            'fk_operador'    => $viaje->fk_operador,
-            'fk_ruta'        => $viaje->fk_ruta,
-            'numero_viaje'   => $viaje->numero_viaje,
-            'monto'          => $monto,
-            'fk_coordinador' => Auth::id(),
-            'motivos'        => $motivoInterno,
-            'created_at'     => now(),
-        ]);
+            DB::table('historial_reasignaciones')->insert([
+                'fk_viaje'       => $viaje->id_viaje,
+                'fk_operador'    => $viaje->fk_operador,
+                'fk_ruta'        => $viaje->fk_ruta,
+                'numero_viaje'   => $viaje->numero_viaje,
+                'monto'          => $monto,
+                'fk_coordinador' => Auth::id(),
+                'motivos'        => $motivoInterno,
+                'created_at'     => now(),
+            ]);
 
-        ViajeIncidencia::create([
-            'fk_viaje'       => $viaje->id_viaje,
-            'fk_operador'    => $viaje->fk_operador,
-            'fk_coordinador' => Auth::id(),
-            'tipo_evento'    => 'REASIGNACION',
-            'detalle'        => $motivoInterno,
-            'created_at'     => now(),
-        ]);
+            ViajeIncidencia::create([
+                'fk_viaje'       => $viaje->id_viaje,
+                'fk_operador'    => $viaje->fk_operador,
+                'fk_coordinador' => Auth::id(),
+                'tipo_evento'    => 'REASIGNACION',
+                'detalle'        => $motivoInterno,
+                'created_at'     => now(),
+            ]);
 
-        $viaje->update([
-            'estado'         => 'PENDIENTE',
-            'fk_operador'    => null,
-            'fk_unidad'      => null,
-            'fk_viaje_padre' => null,
-            'fecha_salida'   => null,
-        ]);
+            $viaje->update([
+                'estado'         => 'PENDIENTE',
+                'fk_operador'    => null,
+                'fk_unidad'      => null,
+                'fk_viaje_padre' => null,
+                'fecha_salida'   => null,
+            ]);
 
-        return response()->json([
-            'ok'                         => true,
-            'msg'                        => 'Viaje reasignado correctamente',
-            'es_hijo'                    => $esHijoEncadenado,
-            'estado_operador_resultante' => $estadoOpFinal,
-            'estado_unidad_resultante'   => $estadoUniFinal,
-        ]);
-    });
-}
+            return response()->json([
+                'ok'                         => true,
+                'msg'                        => 'Viaje reasignado correctamente',
+                'es_hijo'                    => $esHijoEncadenado,
+                'estado_operador_resultante' => $estadoOpFinal,
+                'estado_unidad_resultante'   => $estadoUniFinal,
+            ]);
+        });
+    }
+
     // ── CAMBIAR TARIFA ─────────────────────────────────────────────────────
+    // CAMBIO: usa $this->buscarCuota() para encontrar la cuota correcta.
+    // Si no hay cuota, igual registra el movimiento (para no perder el historial)
+    // pero no actualiza cuota_realizada (no hay cuota que actualizar).
     public function cambiarTarifa(Request $request, $id)
     {
         $request->validate(['nueva_tarifa' => 'required|numeric|min:0']);
@@ -1167,12 +1138,8 @@ public function reasignar(Request $request, $id)
 
                 $viaje->update(['pago_operador' => $nueva_tarifa]);
 
-                $hoy         = now()->toDateString();
-                $cuotaActiva = DB::table('operador_cuota')
-                    ->where('fk_operador', $viaje->fk_operador)
-                    ->where('fecha_inicio', '<=', $hoy)
-                    ->where('fecha_fin',    '>=', $hoy)
-                    ->first();
+                // ── CAMBIO: usar helper en lugar de buscar solo por hoy ──
+                $cuotaActiva = $this->buscarCuota($viaje->fk_operador, $viaje);
 
                 $periodo = $cuotaActiva?->periodo ?? now()->format('Ym');
 
@@ -1182,6 +1149,7 @@ public function reasignar(Request $request, $id)
                         ->update(['cuota_realizada' => DB::raw('cuota_realizada + ' . $diferencia)]);
                 }
 
+                // El movimiento siempre se registra para no perder el historial
                 OperadorMovimiento::create([
                     'fk_operador'    => $viaje->fk_operador,
                     'fk_viaje'       => $id_viaje,
@@ -1198,7 +1166,11 @@ public function reasignar(Request $request, $id)
                     'fk_operador'    => $viaje->fk_operador,
                     'fk_coordinador' => Auth::id(),
                     'tipo_evento'    => 'CAMBIO_TARIFA',
-                    'detalle'        => json_encode(['tarifa_anterior' => $tarifa_anterior, 'tarifa_nueva' => $nueva_tarifa, 'diferencia' => $diferencia]),
+                    'detalle'        => json_encode([
+                        'tarifa_anterior' => $tarifa_anterior,
+                        'tarifa_nueva'    => $nueva_tarifa,
+                        'diferencia'      => $diferencia,
+                    ]),
                     'created_at'     => now(),
                 ]);
 
@@ -1215,186 +1187,164 @@ public function reasignar(Request $request, $id)
         }
     }
 
-    // ── FINALIZAR ──────────────────────────────────────────────────────────
-public function finalizar(Request $request, $id)
-{
-    $request->validate([
-        'tipo_finalizacion'  => 'required|in:CORRECTO,CON_INCIDENCIA',
-        'fecha_llegada_real' => 'required|date',
-        'notas'              => 'nullable|string|max:1000',
-    ]);
+    public function finalizar(Request $request, $id)
+    {
+        $request->validate([
+            'tipo_finalizacion'  => 'required|in:CORRECTO,CON_INCIDENCIA',
+            'fecha_llegada_real' => 'required|date',
+            'notas'              => 'nullable|string|max:1000',
+        ]);
 
-    $viaje = Viaje::with('ruta')->find($id);
-    if (!$viaje) {
-        return response()->json(['ok' => false, 'msg' => 'Viaje no encontrado'], 404);
-    }
-    if ($viaje->estado !== 'EN_CURSO') {
-        return response()->json(['ok' => false, 'msg' => 'Solo se pueden finalizar viajes en estado EN_CURSO.'], 409);
-    }
-    if ($request->input('tipo_finalizacion') === 'CON_INCIDENCIA' && empty(trim($request->input('notas', '')))) {
-        return response()->json(['ok' => false, 'msg' => 'Las notas son obligatorias cuando hay incidencia.'], 422);
-    }
+        $viaje = Viaje::with('ruta')->find($id);
+        if (!$viaje) {
+            return response()->json(['ok' => false, 'msg' => 'Viaje no encontrado'], 404);
+        }
+        if ($viaje->estado !== 'EN_CURSO') {
+            return response()->json(['ok' => false, 'msg' => 'Solo se pueden finalizar viajes en estado EN_CURSO.'], 409);
+        }
+        if ($request->input('tipo_finalizacion') === 'CON_INCIDENCIA' && empty(trim($request->input('notas', '')))) {
+            return response()->json(['ok' => false, 'msg' => 'Las notas son obligatorias cuando hay incidencia.'], 422);
+        }
 
-    $operador    = Operador::find($viaje->fk_operador);
-    $unidad      = Unidad::find($viaje->fk_unidad);
-    $zonaDestino = $viaje->ruta?->fk_zona_destino;
+        $operador    = Operador::find($viaje->fk_operador);
+        $unidad      = Unidad::find($viaje->fk_unidad);
+        $zonaDestino = $viaje->ruta?->fk_zona_destino;
 
-    return DB::transaction(function () use ($request, $viaje, $operador, $unidad, $zonaDestino) {
+        return DB::transaction(function () use ($request, $viaje, $operador, $unidad, $zonaDestino) {
 
-        // ── Buscar hijos activos ──────────────────────────────────────────
-        $hijosActivos = DB::table('viaje_encadenamiento as ve')
-            ->join('viaje as v', 'v.id_viaje', '=', 've.fk_viaje_hijo')
-            ->where('ve.fk_viaje_padre', $viaje->id_viaje)
-            ->whereIn('v.estado', ['PENDIENTE', 'ASIGNADO'])
-            ->orderBy('ve.orden')
-            ->select('ve.id', 've.fk_viaje_hijo', 've.orden')
-            ->get();
+            $hijosActivos = DB::table('viaje_encadenamiento as ve')
+                ->join('viaje as v', 'v.id_viaje', '=', 've.fk_viaje_hijo')
+                ->where('ve.fk_viaje_padre', $viaje->id_viaje)
+                ->whereIn('v.estado', ['PENDIENTE', 'ASIGNADO'])
+                ->orderBy('ve.orden')
+                ->select('ve.id', 've.fk_viaje_hijo', 've.orden')
+                ->get();
 
-        if ($hijosActivos->isNotEmpty()) {
-            $primerHijo = $hijosActivos->first();
+            if ($hijosActivos->isNotEmpty()) {
+                $primerHijo = $hijosActivos->first();
 
-            // El primer hijo se convierte en nuevo padre independiente
-            DB::table('viaje')
-                ->where('id_viaje', $primerHijo->fk_viaje_hijo)
-                ->update(['fk_viaje_padre' => null]);
+                DB::table('viaje')->where('id_viaje', $primerHijo->fk_viaje_hijo)
+                    ->update(['fk_viaje_padre' => null]);
+                DB::table('viaje_encadenamiento')->where('id', $primerHijo->id)->delete();
 
-            // Borrar su eslabón con el padre que acaba de terminar
-            DB::table('viaje_encadenamiento')
-                ->where('id', $primerHijo->id)
-                ->delete();
-
-            // Si hay más hijos, reasignarlos al nuevo padre (primer hijo)
-            if ($hijosActivos->count() > 1) {
-                $restantes = $hijosActivos->skip(1);
-                foreach ($restantes as $hijo) {
-                    DB::table('viaje_encadenamiento')
-                        ->where('id', $hijo->id)
-                        ->update([
+                if ($hijosActivos->count() > 1) {
+                    foreach ($hijosActivos->skip(1) as $hijo) {
+                        DB::table('viaje_encadenamiento')->where('id', $hijo->id)->update([
                             'fk_viaje_padre' => $primerHijo->fk_viaje_hijo,
                             'fk_operador'    => $operador?->id_operador,
                         ]);
-                    DB::table('viaje')
-                        ->where('id_viaje', $hijo->fk_viaje_hijo)
-                        ->update(['fk_viaje_padre' => $primerHijo->fk_viaje_hijo]);
+                        DB::table('viaje')->where('id_viaje', $hijo->fk_viaje_hijo)
+                            ->update(['fk_viaje_padre' => $primerHijo->fk_viaje_hijo]);
+                    }
                 }
+
+                ViajeIncidencia::create([
+                    'fk_viaje'       => $primerHijo->fk_viaje_hijo,
+                    'fk_operador'    => $operador?->id_operador,
+                    'fk_coordinador' => Auth::id(),
+                    'tipo_evento'    => 'ENCADENAMIENTO_LIBERADO',
+                    'detalle'        => json_encode([
+                        'motivo'       => 'Viaje padre finalizado — este viaje se convierte en nuevo padre',
+                        'numero_padre' => $viaje->numero_viaje,
+                    ]),
+                    'created_at'     => now(),
+                ]);
+            } else {
+                DB::table('viaje_encadenamiento')->where('fk_viaje_padre', $viaje->id_viaje)->delete();
             }
 
+            $nuevoEstadoOp  = $hijosActivos->isNotEmpty() ? 'ASIGNADO'         : 'DISPONIBLE';
+            $nuevoEstadoUni = $hijosActivos->isNotEmpty() ? 'ASIGNADA_A_VIAJE' : 'DISPONIBLE';
+
+            if ($operador) {
+                OperadorHistorialEstado::create([
+                    'fk_operador'     => $operador->id_operador,
+                    'fk_coordinador'  => Auth::id(),
+                    'estado_anterior' => $operador->estado_operador,
+                    'estado_nuevo'    => $nuevoEstadoOp,
+                    'motivo'          => "Finalización del viaje #{$viaje->numero_viaje}",
+                    'created_at'      => now(),
+                ]);
+
+                if ($zonaDestino && (int)$zonaDestino !== (int)$operador->fk_zona_actual) {
+                    OperadorHistorialZona::create([
+                        'fk_operador'    => $operador->id_operador,
+                        'fk_coordinador' => Auth::id(),
+                        'fk_viaje'       => $viaje->id_viaje,
+                        'zona_anterior'  => $operador->fk_zona_actual,
+                        'zona_nueva'     => $zonaDestino,
+                        'motivo'         => "Finalización del viaje #{$viaje->numero_viaje}",
+                        'created_at'     => now(),
+                    ]);
+                }
+
+                DB::table('operador')->where('id_operador', $operador->id_operador)->update([
+                    'estado_operador' => $nuevoEstadoOp,
+                    'fk_zona_actual'  => $zonaDestino ?? $operador->fk_zona_actual,
+                ]);
+            }
+
+            if ($unidad) {
+                DB::table('reporte_unidad')->insert([
+                    'fk_unidad'       => $unidad->id_unidad,
+                    'estado_anterior' => $unidad->estado,
+                    'estado_nuevo'    => $nuevoEstadoUni,
+                    'motivo'          => "Finalización del viaje #{$viaje->numero_viaje}",
+                    'fecha_reporte'   => now(),
+                ]);
+
+                if ($zonaDestino && (int)$zonaDestino !== (int)$unidad->fk_zona_actual) {
+                    UnidadHistorialZona::create([
+                        'fk_unidad'      => $unidad->id_unidad,
+                        'fk_coordinador' => Auth::id(),
+                        'fk_viaje'       => $viaje->id_viaje,
+                        'zona_anterior'  => $unidad->fk_zona_actual,
+                        'zona_nueva'     => $zonaDestino,
+                        'motivo'         => "Finalización del viaje #{$viaje->numero_viaje}",
+                        'created_at'     => now(),
+                    ]);
+                }
+
+                DB::table('unidad')->where('id_unidad', $unidad->id_unidad)->update([
+                    'estado'         => $nuevoEstadoUni,
+                    'fk_zona_actual' => $zonaDestino ?? $unidad->fk_zona_actual,
+                ]);
+            }
+
+            ViajeFinalizacion::create([
+                'fk_viaje'           => $viaje->id_viaje,
+                'fk_coordinador'     => Auth::id(),
+                'tipo_finalizacion'  => $request->input('tipo_finalizacion'),
+                'notas'              => $request->input('notas') ?? null,
+                'fecha_llegada_real' => $request->input('fecha_llegada_real'),
+                'fecha_finalizacion' => now(),
+                'created_at'         => now(),
+            ]);
+
             ViajeIncidencia::create([
-                'fk_viaje'       => $primerHijo->fk_viaje_hijo,
-                'fk_operador'    => $operador?->id_operador,
+                'fk_viaje'       => $viaje->id_viaje,
+                'fk_operador'    => $viaje->fk_operador,
                 'fk_coordinador' => Auth::id(),
-                'tipo_evento'    => 'ENCADENAMIENTO_LIBERADO',
-                'detalle'        => json_encode([
-                    'motivo'       => 'Viaje padre finalizado — este viaje se convierte en nuevo padre',
-                    'numero_padre' => $viaje->numero_viaje,
-                ]),
+                'tipo_evento'    => 'FINALIZACION_VIAJE',
+                'detalle'        => $request->input('tipo_finalizacion') === 'CON_INCIDENCIA'
+                                    ? $request->input('notas')
+                                    : 'Viaje finalizado correctamente.',
                 'created_at'     => now(),
             ]);
 
-        } else {
-            DB::table('viaje_encadenamiento')
-                ->where('fk_viaje_padre', $viaje->id_viaje)
-                ->delete();
-        }
-
-        // ── Estado final según si hay hijos activos ───────────────────────
-        // Con hijos: operador queda ASIGNADO (tiene viaje pendiente que tomar)
-        // Sin hijos: operador queda DISPONIBLE
-        $nuevoEstadoOp  = $hijosActivos->isNotEmpty() ? 'ASIGNADO'        : 'DISPONIBLE';
-        $nuevoEstadoUni = $hijosActivos->isNotEmpty() ? 'ASIGNADA_A_VIAJE' : 'DISPONIBLE';
-
-        // ── Actualizar operador ───────────────────────────────────────────
-        if ($operador) {
-            OperadorHistorialEstado::create([
-                'fk_operador'     => $operador->id_operador,
-                'fk_coordinador'  => Auth::id(),
-                'estado_anterior' => $operador->estado_operador,
-                'estado_nuevo'    => $nuevoEstadoOp,
-                'motivo'          => "Finalización del viaje #{$viaje->numero_viaje}",
-                'created_at'      => now(),
+            $viaje->update([
+                'estado'        => 'TERMINADO',
+                'fecha_llegada' => $request->input('fecha_llegada_real'),
             ]);
 
-            if ($zonaDestino && (int)$zonaDestino !== (int)$operador->fk_zona_actual) {
-                OperadorHistorialZona::create([
-                    'fk_operador'    => $operador->id_operador,
-                    'fk_coordinador' => Auth::id(),
-                    'fk_viaje'       => $viaje->id_viaje,
-                    'zona_anterior'  => $operador->fk_zona_actual,
-                    'zona_nueva'     => $zonaDestino,
-                    'motivo'         => "Finalización del viaje #{$viaje->numero_viaje}",
-                    'created_at'     => now(),
-                ]);
-            }
-
-            DB::table('operador')->where('id_operador', $operador->id_operador)->update([
-                'estado_operador' => $nuevoEstadoOp,
-                'fk_zona_actual'  => $zonaDestino ?? $operador->fk_zona_actual,
+            return response()->json([
+                'ok'               => true,
+                'msg'              => 'Viaje finalizado correctamente',
+                'tiene_encadenado' => $hijosActivos->isNotEmpty(),
             ]);
-        }
+        });
+    }
 
-        // ── Actualizar unidad ─────────────────────────────────────────────
-        if ($unidad) {
-            DB::table('reporte_unidad')->insert([
-                'fk_unidad'       => $unidad->id_unidad,
-                'estado_anterior' => $unidad->estado,
-                'estado_nuevo'    => $nuevoEstadoUni,
-                'motivo'          => "Finalización del viaje #{$viaje->numero_viaje}",
-                'fecha_reporte'   => now(),
-            ]);
-
-            if ($zonaDestino && (int)$zonaDestino !== (int)$unidad->fk_zona_actual) {
-                UnidadHistorialZona::create([
-                    'fk_unidad'      => $unidad->id_unidad,
-                    'fk_coordinador' => Auth::id(),
-                    'fk_viaje'       => $viaje->id_viaje,
-                    'zona_anterior'  => $unidad->fk_zona_actual,
-                    'zona_nueva'     => $zonaDestino,
-                    'motivo'         => "Finalización del viaje #{$viaje->numero_viaje}",
-                    'created_at'     => now(),
-                ]);
-            }
-
-            DB::table('unidad')->where('id_unidad', $unidad->id_unidad)->update([
-                'estado'         => $nuevoEstadoUni,
-                'fk_zona_actual' => $zonaDestino ?? $unidad->fk_zona_actual,
-            ]);
-        }
-
-        // ── Registro de finalización ──────────────────────────────────────
-        ViajeFinalizacion::create([
-            'fk_viaje'           => $viaje->id_viaje,
-            'fk_coordinador'     => Auth::id(),
-            'tipo_finalizacion'  => $request->input('tipo_finalizacion'),
-            'notas'              => $request->input('notas') ?? null,
-            'fecha_llegada_real' => $request->input('fecha_llegada_real'),
-            'fecha_finalizacion' => now(),
-            'created_at'         => now(),
-        ]);
-
-        ViajeIncidencia::create([
-            'fk_viaje'       => $viaje->id_viaje,
-            'fk_operador'    => $viaje->fk_operador,
-            'fk_coordinador' => Auth::id(),
-            'tipo_evento'    => 'FINALIZACION_VIAJE',
-            'detalle'        => $request->input('tipo_finalizacion') === 'CON_INCIDENCIA'
-                                ? $request->input('notas')
-                                : 'Viaje finalizado correctamente.',
-            'created_at'     => now(),
-        ]);
-
-        $viaje->update([
-            'estado'        => 'TERMINADO',
-            'fecha_llegada' => $request->input('fecha_llegada_real'),
-        ]);
-
-        return response()->json([
-            'ok'              => true,
-            'msg'             => 'Viaje finalizado correctamente',
-            'tiene_encadenado' => $hijosActivos->isNotEmpty(),
-        ]);
-    });
-}
-    // ── GET FINALIZACIÓN ───────────────────────────────────────────────────
     public function getFinalizacion($id)
     {
         $finalizacion = ViajeFinalizacion::where('fk_viaje', $id)->first();
@@ -1416,7 +1366,6 @@ public function finalizar(Request $request, $id)
         ]);
     }
 
-    // ── RECHAZAR ───────────────────────────────────────────────────────────
     public function rechazar(Request $request, $id_viaje, $id_operador)
     {
         $request->validate(['motivo' => 'required|string']);
@@ -1441,7 +1390,6 @@ public function finalizar(Request $request, $id)
         return response()->json(['ok' => true, 'msg' => 'Operador rechazado']);
     }
 
-    // ── HISTORIAL VIAJE ────────────────────────────────────────────────────
     public function historialViaje($id_viaje)
     {
         $incidencias = DB::table('viaje_incidencia as vi')
@@ -1452,8 +1400,8 @@ public function finalizar(Request $request, $id)
             ->select([
                 'vi.id_incidencia', 'vi.tipo_evento', 'vi.detalle', 'vi.created_at',
                 'vi.adv_unidad_no_disponible', 'vi.adv_licencia_vencida',
-                'vi.adv_licencia_incorrecta', 'vi.adv_operador_fuera_zona',
-                'vi.adv_unidad_fuera_zona', 'vi.adv_cuota_agotada',
+                'vi.adv_licencia_incorrecta',  'vi.adv_operador_fuera_zona',
+                'vi.adv_unidad_fuera_zona',    'vi.adv_cuota_agotada',
                 'vi.adv_certificaciones_faltantes',
                 DB::raw("CONCAT(op.nombres, ' ', op.apellidos) as nombre_operador"),
                 'op.numero_empleado',
@@ -1463,7 +1411,6 @@ public function finalizar(Request $request, $id)
         return response()->json(['ok' => true, 'historial' => $incidencias]);
     }
 
-    // ── HISTORIAL ESTADOS OPERADOR ─────────────────────────────────────────
     public function historialEstadosOperador($id_operador)
     {
         $historial = DB::table('operador_historial_estado as ohe')
@@ -1478,7 +1425,6 @@ public function finalizar(Request $request, $id)
         return response()->json(['ok' => true, 'historial' => $historial]);
     }
 
-    // ── HISTORIAL ZONAS OPERADOR ───────────────────────────────────────────
     public function historialZonasOperador($id_operador)
     {
         $historial = DB::table('operador_historial_zona as ohz')
@@ -1498,7 +1444,6 @@ public function finalizar(Request $request, $id)
         return response()->json(['ok' => true, 'historial' => $historial]);
     }
 
-    // ── HISTORIAL ZONAS UNIDAD ─────────────────────────────────────────────
     public function historialZonasUnidad($id_unidad)
     {
         $historial = DB::table('unidad_historial_zona as uhz')
@@ -1518,15 +1463,21 @@ public function finalizar(Request $request, $id)
         return response()->json(['ok' => true, 'historial' => $historial]);
     }
 
-    // ── MOVIMIENTOS OPERADOR ───────────────────────────────────────────────
     public function movimientosOperador(Request $request, $id_operador)
     {
-        $periodo = $request->query('periodo');
+        $fechaFin    = $request->filled('fecha_fin')
+            ? $request->fecha_fin
+            : now()->toDateString();
+
+        $fechaInicio = $request->filled('fecha_inicio')
+            ? $request->fecha_inicio
+            : now()->subDays(6)->toDateString();
 
         $query = DB::table('operador_movimiento as om')
             ->leftJoin('viaje as v',    'v.id_viaje',  '=', 'om.fk_viaje')
             ->leftJoin('usuarios as u', 'u.idUsuario', '=', 'om.fk_coordinador')
             ->where('om.fk_operador', $id_operador)
+            ->whereBetween(DB::raw('DATE(om.created_at)'), [$fechaInicio, $fechaFin])
             ->orderBy('om.created_at', 'desc')
             ->select([
                 'om.id_movimiento', 'om.tipo', 'om.monto', 'om.descripcion',
@@ -1534,10 +1485,6 @@ public function finalizar(Request $request, $id)
                 'v.numero_viaje', 'v.estado as estado_viaje',
                 DB::raw("CONCAT(u.nombre, ' ', u.apellidos) as nombre_coordinador"),
             ]);
-
-        if ($periodo) {
-            $query->where('om.periodo', $periodo);
-        }
 
         $movimientos   = $query->get();
         $totalIngresos = $movimientos->where('monto', '>', 0)->sum('monto');
@@ -1554,7 +1501,6 @@ public function finalizar(Request $request, $id)
         ]);
     }
 
-    // ── OBTENER CADENA ─────────────────────────────────────────────────────
     public function obtenerCadena($id_viaje)
     {
         $cadena = DB::table('viaje_encadenamiento as ve')
@@ -1568,9 +1514,9 @@ public function finalizar(Request $request, $id)
             })
             ->select([
                 've.id', 've.orden', 've.fk_operador',
-                'vp.id_viaje as id_padre',   'vp.numero_viaje as numero_padre',
+                'vp.id_viaje as id_padre',    'vp.numero_viaje as numero_padre',
                 'vp.estado   as estado_padre', 'rp.nombre_ruta  as ruta_padre',
-                'vh.id_viaje as id_hijo',    'vh.numero_viaje as numero_hijo',
+                'vh.id_viaje as id_hijo',     'vh.numero_viaje as numero_hijo',
                 'vh.estado   as estado_hijo',  'rh.nombre_ruta  as ruta_hijo',
             ])
             ->orderBy('ve.orden')

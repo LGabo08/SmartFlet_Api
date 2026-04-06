@@ -231,4 +231,86 @@ class OperadorCuotaController extends Controller
         $cuota->delete();
         return response()->json(['ok' => true, 'msg' => 'Cuota eliminada correctamente.']);
     }
+
+
+
+
+    /**
+ * AGREGAR este método al OperadorCuotaController.php
+ * Ruta sugerida: GET /api/operadores/cuotas-global
+ *
+ * Devuelve todos los operadores con sus cuotas ordenadas por fecha_inicio desc.
+ */
+public function todosConCuotas()
+{
+    $operadores = Operador::orderBy('nombres')->get();
+
+    $hoy = now()->toDateString();
+
+    $data = $operadores->map(function ($operador) use ($hoy) {
+        $cuotas = OperadorCuota::where('fk_operador', $operador->id_operador)
+            ->orderByDesc('fecha_inicio')
+            ->orderByDesc('id_op_cuota')
+            ->get();
+
+        $cuotaActiva = $cuotas->first(function ($c) use ($hoy) {
+            return $c->fecha_inicio <= $hoy && $c->fecha_fin >= $hoy;
+        });
+
+        return [
+            'id_operador'     => $operador->id_operador,
+            'numero_empleado' => $operador->numero_empleado,
+            'nombre_completo' => trim(($operador->nombres ?? '') . ' ' . ($operador->apellidos ?? '')),
+            'cuota_activa'    => $cuotaActiva,
+            'cuotas'          => $cuotas,
+        ];
+    });
+
+    return response()->json(['ok' => true, 'operadores' => $data]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TAMBIÉN actualizar el método obtenerMovimientos en el controller de movimientos
+// para que acepte fecha_inicio y fecha_fin en lugar de (o además de) periodo.
+//
+// Ejemplo — reemplaza o adapta el método existente de movimientos:
+// ─────────────────────────────────────────────────────────────────────────────
+
+public function movimientosPorOperador(Request $request, $idOperador)
+{
+    // Rango de fechas: si no se manda, por defecto últimos 7 días
+    $fechaFin    = $request->filled('fecha_fin')
+        ? $request->fecha_fin
+        : now()->toDateString();
+
+    $fechaInicio = $request->filled('fecha_inicio')
+        ? $request->fecha_inicio
+        : now()->subDays(6)->toDateString();
+
+    $query = \App\Models\OperadorMovimiento::where('fk_operador', $idOperador)
+        ->whereBetween(\DB::raw('DATE(created_at)'), [$fechaInicio, $fechaFin])
+        ->orderByDesc('created_at');
+
+    // Filtro opcional por tipo
+    if ($request->filled('tipo')) {
+        $query->where('tipo', $request->tipo);
+    }
+
+    $movimientos = $query->get();
+
+    $ingresos = $movimientos->where('monto', '>', 0)->sum('monto');
+    $egresos  = $movimientos->where('monto', '<', 0)->sum('monto');
+
+    return response()->json([
+        'ok'          => true,
+        'fecha_inicio'=> $fechaInicio,
+        'fecha_fin'   => $fechaFin,
+        'movimientos' => $movimientos,
+        'totales'     => [
+            'ingresos' => round($ingresos, 2),
+            'egresos'  => round(abs($egresos), 2),
+            'balance'  => round($ingresos + $egresos, 2),
+        ],
+    ]);
+}
 }

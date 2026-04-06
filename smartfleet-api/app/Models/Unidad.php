@@ -4,7 +4,7 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
-
+use App\Models\Scopes\UsuarioScope;
 class Unidad extends Model
 {
     use HasFactory;
@@ -20,12 +20,23 @@ class Unidad extends Model
 
     // Definir los campos que se pueden asignar masivamente
     protected $fillable = [
+         'fk_usuario', 
         'numero_economico',
         'fk_zona_actual',
         'estado',
         'fk_licencia_requerida',
     ];
      
+    protected static function booted(): void
+{
+    static::addGlobalScope(new UsuarioScope());
+
+    static::creating(function (self $model) {
+        if (auth('api')->check() && empty($model->fk_usuario)) {
+            $model->fk_usuario = auth('api')->id();
+        }
+    });
+}
     // Relaciones con otras tablas
     public function zona()
     {

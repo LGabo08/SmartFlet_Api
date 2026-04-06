@@ -4,7 +4,7 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
-
+use App\Models\Scopes\UsuarioScope;
 class Viaje extends Model
 {
     use HasFactory;
@@ -14,6 +14,7 @@ class Viaje extends Model
     public $timestamps = false;
 
     protected $fillable = [
+        'fk_usuario',
         'numero_viaje',
         'fk_ruta',
         'fk_licencia_requerida',
@@ -28,6 +29,16 @@ class Viaje extends Model
         'producto',             // Nuevo campo
     ];
 
+    protected static function booted(): void
+{
+    static::addGlobalScope(new UsuarioScope());
+
+    static::creating(function (self $model) {
+        if (auth('api')->check() && empty($model->fk_usuario)) {
+            $model->fk_usuario = auth('api')->id();
+        }
+    });
+}
     public function operador()
     {
         return $this->belongsTo(\App\Models\Operador::class, 'fk_operador', 'id_operador');

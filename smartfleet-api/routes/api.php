@@ -16,7 +16,7 @@ use App\Http\Controllers\Api\OperadorCuotaController;
 use App\Http\Controllers\Api\ZonaController;
 use App\Http\Controllers\Api\PanelController;
 use App\Http\Controllers\Api\PermisoController;
-
+use App\Http\Controllers\Api\SincronizacionController;
 // ── PÚBLICAS ──────────────────────────────────────────────────────────────────
 Route::get('/ping', fn() => response()->json(['ok' => true, 'msg' => 'pong']));
 Route::prefix('auth')->group(function () {
@@ -78,7 +78,10 @@ Route::middleware('auth:api')->group(function () {
         ->put('/rutas/{ruta}', [RutaController::class, 'update']);
     Route::middleware('permiso:eliminar_rutas')
         ->delete('/rutas/{ruta}', [RutaController::class, 'destroy']);
-
+// ── SINCRONIZACIÓN ORACLE ─────────────────────────────────────────────────
+Route::get('/sincronizar/verificar', [SincronizacionController::class, 'verificar']);
+Route::middleware('permiso:sincronizar_permisos')
+    ->post('/sincronizar/manual', [SincronizacionController::class, 'sincronizarManual']);
     // ── CERTIFICACIONES ───────────────────────────────────────────────────────
     Route::middleware('permiso:ver_certificaciones')->group(function () {
         Route::get('/certificaciones',                     [CertificacionController::class, 'index']);

@@ -80,6 +80,7 @@ Route::middleware('auth:api')->group(function () {
         ->delete('/rutas/{ruta}', [RutaController::class, 'destroy']);
 // ── SINCRONIZACIÓN ORACLE ─────────────────────────────────────────────────
 Route::get('/sincronizar/verificar', [SincronizacionController::class, 'verificar']);
+Route::get('/sincronizar/verificar-clientes',[SincronizacionController::class, 'verificarClientes']); // ← nuevo
 Route::middleware('permiso:sincronizar_permisos')
     ->post('/sincronizar/manual', [SincronizacionController::class, 'sincronizarManual']);
     // ── CERTIFICACIONES ───────────────────────────────────────────────────────

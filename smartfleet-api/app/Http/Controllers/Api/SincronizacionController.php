@@ -24,7 +24,19 @@ class SincronizacionController extends Controller
             'ultima_sincronizacion' => $ultima?->ejecutado_at,
         ]);
     }
+    public function verificarClientes(SincronizacionControlService $control): JsonResponse
+{
+    $despachado = $control->verificarYSincronizarClientes();
+    $ultima     = $control->ultimaSincronizacion();  // puedes hacer uno específico
 
+    return response()->json([
+        'ok'         => true,
+        'despachado' => $despachado,
+        'mensaje'    => $despachado
+            ? 'Sincronización de clientes iniciada'
+            : 'Clientes ya están actualizados',
+    ]);
+}
     // ── Forzar sincronización manual desde el panel ──────────────────────────
     public function sincronizarManual(SincronizarRutasHesaService $service): JsonResponse
     {
